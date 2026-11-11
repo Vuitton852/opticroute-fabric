@@ -1,127 +1,153 @@
 # OpticRoute Fabric
-### Intelligent Software Routing Fabric for Silicon Photonics Data Centers
+### Physics-Aware Intelligent Routing for Silicon Photonics Data Centers
 
-**Breaking the Copper Wall. Orchestrating the Optical Future.**
+**Engineering the Optical Fabric. Optimizing the Physics. Scaling AI Infrastructure.**
 
 ---
 
 ## 1. Executive Summary
 
-### Beyond the Copper Wall
+### Breaking the Copper Wall
 
-The rapid expansion of artificial intelligence has fundamentally transformed data center networking requirements. Modern AI training clusters, particularly those operating at the scale of **100,000+ GPUs**, demand unprecedented east-west bandwidth, ultra-low latency, and highly efficient interconnectivity.
+The rapid expansion of artificial intelligence is pushing conventional data center networking toward its physical limits.
 
-Traditional electrical networking architectures are increasingly approaching their physical and operational limits, commonly referred to as the **Copper Wall**.
+At the scale of 100,000+ GPU clusters, traditional electrical interconnects face increasing challenges involving bandwidth, power consumption, congestion, and thermal efficiency.
 
-As GPU clusters scale, conventional electrical interconnects encounter several critical challenges:
+This challenge is commonly described as the **Copper Wall**.
 
-- **Bandwidth limitations:** Electrical interconnects struggle to accommodate the massive communication demands of distributed AI training.
-- **Power consumption:** High-speed electrical signaling increases power requirements across large-scale switching infrastructure.
-- **Network congestion:** Static routing strategies, such as Equal-Cost Multi-Path (ECMP), can distribute traffic inefficiently under asymmetric workloads.
-- **Latency degradation:** Link contention and congestion introduce communication delays that negatively affect distributed GPU workloads.
-- **Infrastructure scalability:** Increasing electrical networking capacity introduces additional complexity, cost, and power overhead.
+**OpticRoute Fabric** addresses this challenge through an intelligent software orchestration layer designed for next-generation Silicon Photonics data center infrastructure.
 
-### Our Solution: Intelligent Optical Orchestration
+Unlike conventional routing simulations that focus primarily on abstract graph connectivity, OpticRoute incorporates physical-layer constraints into its network model.
 
-**OpticRoute Fabric** is an Intelligent Software Routing Fabric designed to optimize traffic distribution across next-generation Silicon Photonics data center networks.
+Our simulation now accounts for:
 
-Rather than relying exclusively on conventional electrical routing strategies, OpticRoute introduces an intelligent orchestration layer that models network topology, evaluates link utilization, and makes routing decisions designed to improve network performance under demanding workloads.
+- **WDM 16-channel wavelength slicing:** Models wavelength-level resource allocation across optical links.
+- **Optical insertion loss:** Enforces a 15.0 dB optical insertion loss budget.
+- **Thermal drift:** Models switch temperature behavior, including operating conditions reaching 85°C.
+- **Congestion-aware routing:** Evaluates network conditions before allocating traffic.
+- **Physics-aware orchestration:** Incorporates optical and thermal constraints into routing decisions.
 
-The platform focuses on:
-
-- Network topology modeling and analysis.
-- Intelligent optical traffic orchestration.
-- Congestion-aware path selection.
-- Dynamic workload-aware routing.
-- Performance benchmarking against traditional ECMP routing.
-- Scalable network simulation for next-generation AI infrastructure.
-
-Our objective is straightforward:
-
-**Transform data center networking from static packet forwarding into intelligent, workload-aware optical traffic orchestration.**
+The objective is to move beyond theoretical routing efficiency toward physically constrained, intelligent optical network orchestration.
 
 ---
 
-## 2. Key Performance Breakthroughs
+## 2. Physics & Performance Benchmark
 
-### Benchmark Overview
+### 50 GB Cross-Pod Shift Workload
 
-OpticRoute Fabric was evaluated using a Cross-Pod Shift workload designed to simulate substantial east-west traffic movement between data center pods.
+OpticRoute Fabric was benchmarked against conventional Equal-Cost Multi-Path (ECMP) routing under a demanding 50 GB Cross-Pod Shift workload.
 
-The benchmark compares our `OpticalRoutingEngine` against conventional ECMP routing.
+The benchmark evaluates not only communication latency but also physical resource contention, optical flow collisions, and switch thermal behavior.
 
-The most significant result was observed under the 50GB workload, where OpticRoute achieved a **71.7% latency performance gain**, eliminated observed link overloads, and reduced maximum link utilization from 200% to 100%.
+### Benchmark Results
 
-### Cross-Pod Shift Benchmark Results
+| Performance Metric | OpticalRoutingEngine | ECMP |
+|---|---:|---:|
+| Blocked / Collided Flows | **0.0** | 4.0 |
+| Thermal-Throttled Switches (≥80°C) | **0.00** | 1.86 |
+| Peak Switch Temperature | **67.0°C** | 82.4°C |
+| Average Effective Latency | **1,160.0 ns** | 3,312.3 ns |
 
-| Workload | Routing Strategy | Latency Performance Gain | Overloaded Links | Maximum Link Utilization |
-|---|---|---:|---:|---:|
-| 10GB | ECMP | Baseline | Benchmark data required | Benchmark data required |
-| 10GB | OpticRoute | Benchmark data required | Benchmark data required | Benchmark data required |
-| 50GB | ECMP | Baseline | 9.0 | 200% |
-| 50GB | OpticRoute | **+71.7%** | **0.0** | **100%** |
+<sub>Benchmark workload: 50 GB Cross-Pod Shift. Lower values indicate better performance for all four metrics.</sub>
 
-*Note: Exact 10GB benchmark measurements have not been included in the supplied results. They should be populated from the original benchmark output rather than estimated.*
+### Key Performance Breakthroughs
 
-### 50GB Performance Highlights
+**1. 65.0% Latency Performance Gain**
 
-**1. 71.7% Latency Performance Gain**
+OpticRoute reduced average effective latency from 3,312.3 ns to 1,160.0 ns compared with ECMP.
 
-The OpticalRoutingEngine demonstrated a substantial latency improvement over conventional ECMP routing under the 50GB Cross-Pod Shift workload.
+**2. Zero Blocked or Collided Flows**
 
-**2. Complete Elimination of Observed Link Overloads**
+The OpticalRoutingEngine recorded zero blocked or collided flows, compared with four under ECMP.
 
-| Routing Strategy | Overloaded Links |
-|---|---:|
-| ECMP | 9 |
-| OpticRoute | 0 |
+**3. Improved Thermal Stability**
 
-OpticRoute eliminated all nine link overloads observed in the ECMP benchmark.
+| Thermal Metric | OpticalRoutingEngine | ECMP |
+|---|---:|---:|
+| Peak Temperature | 67.0°C | 82.4°C |
+| Thermal-Throttled Switches | 0.00 | 1.86 |
 
-**3. Maximum Link Utilization Reduced by 50%**
+The engine maintained peak switch temperature below the 80°C thermal-throttling threshold.
 
-| Routing Strategy | Maximum Utilization |
-|---|---:|
-| ECMP | 200% |
-| OpticRoute | 100% |
+**4. Physics-Aware Resource Management**
 
-This represents a reduction in maximum observed link utilization from 200% to 100%.
-
-### Why These Results Matter
-
-Distributed AI training workloads generate substantial communication traffic between GPU nodes and pods.
-
-Network congestion can introduce synchronization delays, reduce effective GPU utilization, and negatively affect overall training throughput.
-
-By incorporating intelligent routing decisions into the network orchestration layer, OpticRoute aims to reduce congestion and improve communication efficiency across optical data center infrastructure.
-
-These results represent simulation benchmarks, not yet independently validated production data center measurements.
+By incorporating wavelength allocation, insertion-loss budgets, and thermal constraints, OpticRoute evaluates routing decisions against a more realistic optical networking environment.
 
 ---
 
-## 3. Repository Architecture
+## 3. Silicon Photonics Physics Model
 
-OpticRoute Fabric follows a modular architecture designed to separate network infrastructure modeling, routing intelligence, workload generation, and performance validation.
+OpticRoute's simulation architecture incorporates three important physical-layer considerations.
 
-### Project Structure
+| Physical Component | Simulation Parameter | Purpose |
+|---|---|---|
+| Wavelength Division Multiplexing | 16 channels | Models wavelength-level traffic allocation. |
+| Optical Insertion Loss | 15.0 dB budget | Represents optical signal attenuation constraints. |
+| Switch Thermal Behavior | Up to 85°C | Models temperature-dependent operating conditions and thermal throttling. |
+
+### Wavelength Division Multiplexing (WDM)
+
+The simulation models optical links with 16 independently allocated wavelength channels.
+
+This introduces wavelength-level resource constraints that conventional graph-only routing models cannot adequately represent.
+
+### Optical Insertion Loss
+
+Optical insertion loss is incorporated through a 15.0 dB budget.
+
+Routing decisions must account for the optical loss constraints represented in the simulation.
+
+### Thermal-Aware Orchestration
+
+Switch thermal behavior is modeled to capture temperature increases and thermal-throttling conditions.
+
+The benchmark uses 80°C as the thermal-throttling threshold and evaluates switch temperatures reaching up to 85°C.
+
+---
+
+## 4. Workload Constraints & Physical Limits
+
+### Ring All-Reduce: GPU Access-Link Saturation
+
+Not every performance limitation originates within the optical switching fabric.
+
+Our benchmark suite identifies an important physical constraint: **Ring All-Reduce workloads at 30 GB and above encounter the physical 400 Gbps GPU access-link limits.**
+
+These conditions are properly flagged by the benchmark suite.
+
+This distinction is important when interpreting results:
+
+- Optical routing improvements cannot eliminate a physical access-link bandwidth ceiling.
+- GPU access-link saturation must be distinguished from optical fabric congestion.
+- Benchmark results should account for bottlenecks at both the optical switching layer and GPU attachment layer.
+
+OpticRoute therefore treats physical infrastructure limits as first-class benchmarking considerations rather than incorrectly attributing every performance bottleneck to routing inefficiency.
+
+---
+
+## 5. Repository Architecture
+
+OpticRoute Fabric uses a modular architecture separating routing intelligence, physical network simulation, workload generation, and performance validation.
 
 ```text
 opticroute-fabric/
 │
 ├── core/
 │   ├── __init__.py
-│   ├── topology.py
 │   ├── routing_engine.py
+│   ├── optical_physics.py
 │   └── ...
 │
 ├── simulation/
 │   ├── __init__.py
 │   ├── topology.py
+│   ├── optical_network.py
 │   └── ...
 │
 ├── workloads/
 │   ├── __init__.py
 │   ├── cross_pod_shift.py
+│   ├── ring_all_reduce.py
 │   └── ...
 │
 ├── tests/
@@ -134,72 +160,50 @@ opticroute-fabric/
 └── .gitignore
 ```
 
-*The tree illustrates the intended architectural organization. Individual filenames should be reconciled with the actual repository contents.*
+*Illustrative architecture: reconcile individual filenames with the actual repository before publishing.*
 
-### Architectural Components
+### Component Responsibilities
 
 | Directory | Responsibility |
 |---|---|
-| `core/` | Core routing intelligence, optical orchestration logic, and path-selection algorithms. |
-| `simulation/` | Network topology modeling, infrastructure representation, and simulation environments. |
-| `workloads/` | Traffic workload definitions, including Cross-Pod Shift scenarios. |
-| `tests/` | Automated validation, performance benchmarking, and comparisons against baseline routing strategies. |
-
-### Design Philosophy
-
-The architecture prioritizes:
-
-- **Modularity:** Independent components with clearly defined responsibilities.
-- **Extensibility:** Support for additional routing algorithms and optical network models.
-- **Reproducibility:** Repeatable workload simulations and benchmark comparisons.
-- **Observability:** Measurable routing decisions and network performance metrics.
-- **Scalability:** An architectural foundation for increasingly complex AI data center topologies.
+| `core/` | Routing intelligence, optical orchestration, and physical-aware decision logic. |
+| `simulation/` | Network topology, optical infrastructure, and physical-layer simulation. |
+| `workloads/` | Cross-Pod Shift, Ring All-Reduce, and other traffic scenarios. |
+| `tests/` | Benchmark execution, validation, and routing performance comparisons. |
 
 ---
 
-## 4. Getting Started
+## 6. Getting Started
 
 ### Prerequisites
-
-Before running OpticRoute Fabric, ensure your development environment includes:
 
 - Python 3.14.2
 - Git
 - pip
 - NetworkX
-- Access to a terminal or command-line interface.
 
 ### Step 1: Clone the Repository
 
-Clone the project from GitHub:
-
 ```bash
 git clone https://github.com/YOUR_USERNAME/opticroute-fabric.git
-```
-
-Navigate into the project directory:
-
-```bash
 cd opticroute-fabric
 ```
 
 ### Step 2: Create a Virtual Environment
 
-Creating an isolated Python environment helps prevent dependency conflicts.
-
 ```bash
 python3 -m venv .venv
 ```
 
-Activate the environment.
+Activate it:
 
-**Linux / macOS:**
+**Linux / macOS**
 
 ```bash
 source .venv/bin/activate
 ```
 
-**Windows PowerShell:**
+**Windows PowerShell**
 
 ```powershell
 .venv\Scripts\Activate.ps1
@@ -207,83 +211,79 @@ source .venv/bin/activate
 
 ### Step 3: Install Dependencies
 
-Install the project's required Python packages:
-
 ```bash
 pip install --upgrade pip
-```
-
-Then install the dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-### Step 4: Execute the Benchmark
-
-Run the benchmark suite:
+### Step 4: Execute the Benchmark Suite
 
 ```bash
 python3 tests/benchmark.py
 ```
 
-The benchmark executes the configured simulation scenarios and evaluates routing performance against the ECMP baseline.
+### Step 5: Evaluate Results
 
-### Step 5: Analyze the Results
+Review the benchmark output for:
 
-Review the benchmark output for the following metrics:
+- Average effective latency.
+- Blocked and collided optical flows.
+- Switch thermal-throttling events.
+- Peak switch temperature.
+- Wavelength allocation and resource contention.
+- Optical insertion-loss constraints.
+- GPU access-link saturation warnings.
 
-| Metric | Description |
-|---|---|
-| Latency | Measures communication delay under the simulated workload. |
-| Overloaded Links | Counts links exceeding their defined capacity. |
-| Maximum Link Utilization | Measures the highest observed link utilization relative to capacity. |
-| Performance Gain | Quantifies the latency improvement achieved by OpticRoute relative to ECMP. |
-
-For reproducibility, preserve the workload configuration, topology parameters, routing settings, and benchmark output associated with each experiment.
+For reproducible experiments, preserve topology configurations, workload parameters, physical-layer settings, and benchmark outputs.
 
 ---
 
-## 5. Vision and Future Development
-
-OpticRoute Fabric is being developed around a broader vision: **an intelligent software control plane for next-generation optical data center infrastructure.**
+## 7. Development Roadmap
 
 Potential future development directions include:
 
-- Dynamic congestion-aware routing.
-- Advanced multi-path optical traffic scheduling.
-- GPU communication topology awareness.
-- Silicon Photonics resource allocation and orchestration.
-- Reinforcement learning for adaptive routing decisions.
+- Dynamic wavelength allocation and scheduling.
+- Advanced thermal-aware routing algorithms.
 - Optical circuit switching integration.
-- Real-time network telemetry and observability.
-- Large-scale simulations involving thousands of interconnected GPU nodes.
-- Integration with distributed AI training infrastructure.
+- Real-time optical telemetry.
+- Adaptive congestion prediction.
+- GPU communication topology awareness.
+- Multi-pod optical resource orchestration.
+- Reinforcement learning for routing optimization.
+- Hardware-in-the-loop validation.
+- Large-scale simulations of hyperscale GPU infrastructure.
 
-The long-term objective is to create a software intelligence layer capable of coordinating complex optical networking resources efficiently across hyperscale AI infrastructure.
-
----
-
-## 6. Project Status
-
-**Current Focus:** Intelligent optical routing simulation and performance validation.
-
-**Benchmark Status:** Successful simulation execution with a reported 71.7% latency performance gain under the 50GB Cross-Pod Shift workload.
-
-**Primary Benchmark:** OpticalRoutingEngine versus conventional ECMP.
-
-**Core Technologies:** Python 3.14.2 and NetworkX.
+The long-term vision is an intelligent control plane capable of coordinating optical networking resources while respecting real physical infrastructure constraints.
 
 ---
 
-## 7. Closing Statement
+## 8. Project Status
 
-The future of AI infrastructure will not be determined by GPU performance alone.
+| Category | Current Status |
+|---|---|
+| Network topology simulation | Implemented |
+| Intelligent optical routing | Implemented |
+| WDM wavelength modeling | 16-channel simulation |
+| Optical insertion-loss modeling | 15.0 dB budget |
+| Switch thermal modeling | Up to 85°C |
+| Cross-Pod Shift benchmarking | Successfully executed |
+| Ring All-Reduce benchmarking | Physical access-link limits flagged |
+| ECMP comparison | Implemented |
 
-It will also depend on how efficiently those GPUs communicate.
+*Performance figures represent simulation benchmark results and should not be interpreted as independently measured production hardware performance.*
 
-As AI clusters expand beyond traditional networking limits, intelligent orchestration of optical infrastructure will become increasingly important.
+---
 
-**OpticRoute Fabric is our step toward that future.**
+## 9. Final Vision
 
-*Intelligent Routing. Optical Infrastructure. Scalable AI Computing.*
+The next generation of AI infrastructure will require more than faster GPUs.
+
+It will require intelligent orchestration of the networks connecting them.
+
+OpticRoute Fabric is being developed around a fundamental principle:
+
+**Optical networking intelligence must understand the physics of the infrastructure it controls.**
+
+By combining workload-aware routing with wavelength allocation, optical loss constraints, and thermal awareness, we are building toward a more intelligent foundation for hyperscale Silicon Photonics data centers.
+
+**OpticRoute Fabric — Intelligent Routing for the Optical AI Era.**

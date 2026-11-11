@@ -1,28 +1,37 @@
 """
 tests/benchmark.py
 
-Head-to-head benchmark: standard ECMP vs. the congestion-aware OpticalRoutingEngine.
+Physics & performance benchmark: blind ECMP vs. the physics-aware OpticalRoutingEngine.
 
-Both routers are given the exact same flows on the same FatTreeTopology and are
-scored by the same physical model, so the comparison is apples to apples:
+Both routers receive identical flows in identical order on the same FatTreeTopology and
+are judged by one shared model, so the comparison is apples to apples.
 
-  * Link utilization  = booked demand (Gbps) / bandwidth_gbps.
-  * Overloaded link   = a directed link with utilization above 100%.
-  * Link latency      = base_latency_ns + utilization * SERIALIZATION_PENALTY_NS,
-                        plus an exponential penalty once the link is overloaded.
-  * Avg packet latency = per-flow path latency, weighted by traffic volume.
+Blind ECMP
+    Pins every flow to a random shortest switch-only path. It never looks at booked
+    wavelengths or switch temperature. It books wavelengths first-fit; when a flow needs
+    more channels than are free it overlaps channels that are already in use (a WDM
+    collision), and a copper link pushed past its bandwidth is a collision too. The
+    flow is still sent, and still heats every switch on its path.
 
-ECMP is modeled as load-blind: each flow is pinned to one randomly chosen shortest
-switch-only path, which mimics hash-based path selection and its collisions. Because
-a single random draw is noisy, ECMP is run over several seeded trials and the
-reported ECMP figures are means across those trials.
+OpticalRoutingEngine
+    Routes only over paths with free wavelengths, copper headroom and power budget, and
+    steers around hot switches. A flow with no feasible path is blocked and sends nothing.
 
-Two workloads are swept over increasing tensor sizes:
+Failed flows
+    ECMP: flows that collided when booked. Engine: flows that were blocked. Counted at
+    booking time, so the earlier flows that later share a collided link are not counted
+    as failed; the harm to them shows up in latency instead.
 
-  1. Ring All-Reduce (from AIWorkloadGenerator). Ring neighbours mostly share an edge
-     switch, so there is little path diversity to exploit and the routers will often tie.
-  2. Cross-pod shift. Every GPU sends one tensor to its peer in the next pod. This
-     is the classic fat-tree stress pattern, where load-blind path choice collides.
+Shared scoring (computed after all flows are placed, from the final fabric state)
+    link latency = base + utilization x serialization penalty
+                   + an exponential penalty once utilization exceeds 100%
+    thermal      = (switch temperature - ambient) x thermal penalty, summed over the
+                   switches on the path
+    Average latency is weighted by traffic volume and covers delivered flows: every flow
+    for ECMP (collided ones included), routed flows only for the engine.
+
+Both routers use the engine's own heating, thermal-penalty and serialization settings.
+Two workloads are swept over 10-50 GB tensors: Ring All-Reduce and Cross-Pod Shift.
 """
 
 from __future__ import annotations
@@ -47,7 +56,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from core.routing_engine import OpticalRoutingEngine  # noqa: E402
+from core.routing_engine import AMBIENT_TEMP_C, OpticalRoutingEngine  # noqa: E402
 from simulation.topology import FatTreeTopology  # noqa: E402
 from workloads.traffic_generator import AIWorkloadGenerator, Flow, FlowPriority  # noqa: E402
 
@@ -55,33 +64,66 @@ from workloads.traffic_generator import AIWorkloadGenerator, Flow, FlowPriority 
 # Configuration
 # --------------------------------------------------------------------------- #
 TENSOR_SIZES_GB: tuple[float, ...] = (10.0, 20.0, 30.0, 40.0, 50.0)
-SERIALIZATION_PENALTY_NS = 100.0  # latency added to a link at 100% utilization
-OVERLOAD_STEEPNESS = 3.0  # exponential growth rate of the overload penalty
-MAX_OVERLOAD_EXCESS = 10.0  # cap on (utilization - 1) inside exp(), avoids overflow
-OVERLOAD_EPSILON = 1e-9  # tolerance so exactly-100% links don't count as overloaded
+THROTTLE_TEMP_C = 80.0  # a switch at or above this is thermally throttling
+OVERLOAD_STEEPNESS = 3.0  # exponential growth rate of the overload latency penalty
+MAX_OVERLOAD_EXCESS = 10.0  # cap on (utilization - 1) inside expm1(), avoids overflow
+EPSILON = 1e-9
 BITS_PER_BYTE = 8
+SWITCH_TYPES = frozenset({"core", "aggregation", "edge"})
+
+Edge = tuple[str, str]
 
 
 # --------------------------------------------------------------------------- #
 # Data structures
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
+class PhysicsModel:
+    """Physical constants shared by both routers, read from the engine itself."""
+
+    serialization_penalty_ns: float
+    thermal_penalty_ns_per_c: float
+    heating_c_per_gbps: float
+    sync_window_s: float
+
+    @classmethod
+    def from_engine(cls, engine: OpticalRoutingEngine) -> PhysicsModel:
+        return cls(
+            serialization_penalty_ns=engine.serialization_penalty_ns,
+            thermal_penalty_ns_per_c=engine.thermal_penalty_ns_per_c,
+            heating_c_per_gbps=engine.heating_c_per_gbps,
+            sync_window_s=engine.sync_window_s,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PlacedFlow:
-    """A flow pinned to a concrete path by one of the routers."""
+    """A delivered flow pinned to a concrete path."""
 
     path: tuple[str, ...]
     volume_gbits: float
     demand_gbps: float
 
 
+@dataclass(slots=True)
+class RunResult:
+    """Final fabric state after one router has handled every flow."""
+
+    placed: list[PlacedFlow]
+    load: dict[Edge, float]  # booked Gbps per directed edge
+    temps: dict[str, float]  # final temperature per switch
+    failed_flows: int  # ECMP: collided. Engine: blocked.
+
+
 @dataclass(frozen=True, slots=True)
 class Metrics:
-    """Fabric-wide results for one routing run (or the mean of several)."""
+    """Results for one routing run (or the mean of several)."""
 
-    total_volume_gbits: float
-    overloaded_links: float
-    avg_latency_ns: float
-    max_utilization: float  # fraction, 1.0 == 100%
+    total_flows: int
+    failed_flows: float
+    hot_switches: float  # switches at or above THROTTLE_TEMP_C
+    peak_temp_c: float
+    avg_latency_ns: float  # NaN when no flow was delivered
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +131,7 @@ class SweepRow:
     tensor_size_gb: float
     ecmp: Metrics  # mean across ECMP trials
     engine: Metrics
+    port_limited: bool  # a single flow exceeds its GPU's access link
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,51 +144,50 @@ class WorkloadSpec:
 # --------------------------------------------------------------------------- #
 # Shared physical model
 # --------------------------------------------------------------------------- #
-def link_latency_ns(base_latency_ns: float, utilization: float) -> float:
+def link_latency_ns(base_latency_ns: float, utilization: float, serialization_penalty_ns: float) -> float:
     """Latency of one link: linear in load, then exponential once overloaded."""
-    latency = base_latency_ns + utilization * SERIALIZATION_PENALTY_NS
-    if utilization > 1.0:
+    latency = base_latency_ns + utilization * serialization_penalty_ns
+    if utilization > 1.0 + EPSILON:
         excess = min(utilization - 1.0, MAX_OVERLOAD_EXCESS)
-        latency += SERIALIZATION_PENALTY_NS * math.expm1(OVERLOAD_STEEPNESS * excess)
+        latency += serialization_penalty_ns * math.expm1(OVERLOAD_STEEPNESS * excess)
     return latency
 
 
-def evaluate(graph: nx.DiGraph, placed: Sequence[PlacedFlow]) -> Metrics:
-    """Score a complete set of placed flows. Reads only static link attributes."""
-    loads: dict[tuple[str, str], float] = defaultdict(float)
-    for flow in placed:
-        for edge in zip(flow.path, flow.path[1:]):
-            loads[edge] += flow.demand_gbps
-
-    utilization = {
-        edge: load / graph.edges[edge]["bandwidth_gbps"] for edge, load in loads.items()
-    }
-    overloaded = sum(1 for util in utilization.values() if util > 1.0 + OVERLOAD_EPSILON)
-    max_util = max(utilization.values(), default=0.0)
-
-    total_volume = sum(flow.volume_gbits for flow in placed)
+def evaluate(graph: nx.DiGraph, run: RunResult, physics: PhysicsModel, total_flows: int) -> Metrics:
+    """Score a finished run. Reads only static link attributes and the run's final state."""
     weighted_latency = 0.0
-    for flow in placed:
-        path_latency = sum(
-            link_latency_ns(graph.edges[edge]["base_latency_ns"], utilization[edge])
-            for edge in zip(flow.path, flow.path[1:])
-        )
-        weighted_latency += path_latency * flow.volume_gbits
+    total_volume = 0.0
+    for flow in run.placed:
+        latency = 0.0
+        for edge in zip(flow.path, flow.path[1:]):
+            attrs = graph.edges[edge]
+            utilization = run.load.get(edge, 0.0) / attrs["bandwidth_gbps"]
+            latency += link_latency_ns(
+                attrs["base_latency_ns"], utilization, physics.serialization_penalty_ns
+            )
+        for switch in flow.path[1:-1]:
+            degrees_above_ambient = max(0.0, run.temps[switch] - AMBIENT_TEMP_C)
+            latency += degrees_above_ambient * physics.thermal_penalty_ns_per_c
+        weighted_latency += latency * flow.volume_gbits
+        total_volume += flow.volume_gbits
 
     return Metrics(
-        total_volume_gbits=total_volume,
-        overloaded_links=float(overloaded),
-        avg_latency_ns=weighted_latency / total_volume if total_volume else 0.0,
-        max_utilization=max_util,
+        total_flows=total_flows,
+        failed_flows=float(run.failed_flows),
+        hot_switches=float(sum(1 for t in run.temps.values() if t >= THROTTLE_TEMP_C - EPSILON)),
+        peak_temp_c=max(run.temps.values(), default=AMBIENT_TEMP_C),
+        avg_latency_ns=weighted_latency / total_volume if total_volume else math.nan,
     )
 
 
 def mean_metrics(runs: Sequence[Metrics]) -> Metrics:
+    latencies = [m.avg_latency_ns for m in runs if not math.isnan(m.avg_latency_ns)]
     return Metrics(
-        total_volume_gbits=statistics.fmean(m.total_volume_gbits for m in runs),
-        overloaded_links=statistics.fmean(m.overloaded_links for m in runs),
-        avg_latency_ns=statistics.fmean(m.avg_latency_ns for m in runs),
-        max_utilization=statistics.fmean(m.max_utilization for m in runs),
+        total_flows=runs[0].total_flows,
+        failed_flows=statistics.fmean(m.failed_flows for m in runs),
+        hot_switches=statistics.fmean(m.hot_switches for m in runs),
+        peak_temp_c=statistics.fmean(m.peak_temp_c for m in runs),
+        avg_latency_ns=statistics.fmean(latencies) if latencies else math.nan,
     )
 
 
@@ -153,12 +195,16 @@ def mean_metrics(runs: Sequence[Metrics]) -> Metrics:
 # Routers under test
 # --------------------------------------------------------------------------- #
 class ECMPRouter:
-    """Load-blind ECMP: pin each flow to a random shortest switch-only path."""
+    """
+    Blind ECMP with physical consequences. It works on its own private state, so it
+    never touches the topology graph that the engine books onto.
+    """
 
-    def __init__(self, topology: FatTreeTopology, sync_window_s: float) -> None:
-        self.graph: nx.DiGraph = topology.graph
-        self.sync_window_s = sync_window_s
-        self._path_cache: dict[tuple[str, str], list[tuple[str, ...]]] = {}
+    def __init__(self, graph: nx.DiGraph, physics: PhysicsModel) -> None:
+        self.graph = graph
+        self.physics = physics
+        self._switches = [n for n, a in graph.nodes(data=True) if a.get("type") in SWITCH_TYPES]
+        self._path_cache: dict[Edge, list[tuple[str, ...]]] = {}
 
     def _equal_cost_paths(self, source: str, destination: str) -> list[tuple[str, ...]]:
         key = (source, destination)
@@ -174,42 +220,78 @@ class ECMPRouter:
             self._path_cache[key] = cached
         return cached
 
-    def route(self, flows: Sequence[Flow], rng: random.Random) -> list[PlacedFlow]:
-        return [
-            PlacedFlow(
-                path=rng.choice(self._equal_cost_paths(flow.source_gpu, flow.destination_gpu)),
-                volume_gbits=flow.traffic_volume_gbits,
-                demand_gbps=flow.traffic_volume_gbits / self.sync_window_s,
-            )
-            for flow in flows
-        ]
+    def route(self, flows: Sequence[Flow], rng: random.Random) -> RunResult:
+        graph, physics = self.graph, self.physics
+        booked: dict[Edge, set[int]] = defaultdict(set)
+        load: dict[Edge, float] = defaultdict(float)
+        temps = {switch: AMBIENT_TEMP_C for switch in self._switches}
+        placed: list[PlacedFlow] = []
+        collided_flows = 0
+
+        for flow in flows:
+            demand = flow.traffic_volume_gbits / physics.sync_window_s
+            path = rng.choice(self._equal_cost_paths(flow.source_gpu, flow.destination_gpu))
+            collided = False
+
+            for edge in zip(path, path[1:]):
+                attrs = graph.edges[edge]
+                if attrs["media_type"] == "optical":
+                    needed = OpticalRoutingEngine._channels_needed(attrs, demand)
+                    in_use = booked[edge]
+                    free = [c for c in range(attrs["total_wdm_channels"]) if c not in in_use]
+                    taken = free[:needed]
+                    if needed > len(free):
+                        # Blind ECMP sends anyway and lands on wavelengths already in use.
+                        collided = True
+                        taken += sorted(in_use)[: needed - len(taken)]
+                    in_use.update(taken)
+                elif load[edge] + demand > attrs["bandwidth_gbps"] + EPSILON:
+                    collided = True  # copper link pushed past its bandwidth
+                load[edge] += demand
+
+            heat_c = physics.heating_c_per_gbps * demand
+            for switch in path[1:-1]:
+                temps[switch] = min(graph.nodes[switch]["max_temp_c"], temps[switch] + heat_c)
+
+            collided_flows += collided
+            placed.append(PlacedFlow(path, flow.traffic_volume_gbits, demand))
+
+        return RunResult(placed=placed, load=dict(load), temps=temps, failed_flows=collided_flows)
 
 
-def run_engine(
-    engine: OpticalRoutingEngine, graph: nx.DiGraph, flows: Sequence[Flow]
-) -> Metrics:
-    """Route with the OpticalRoutingEngine, then score with the shared model."""
+def run_engine(engine: OpticalRoutingEngine, flows: Sequence[Flow]) -> RunResult:
+    """Route with the OpticalRoutingEngine and check its own books before reporting."""
+    graph = engine.graph
     engine.reset_fabric_load()
     routes = engine.allocate_routes(flows)
-    placed = [
-        PlacedFlow(
-            path=route.path,
-            volume_gbits=flows[index].traffic_volume_gbits,
-            demand_gbps=route.demand_gbps,
-        )
-        for index, route in routes.items()
-    ]
-    metrics = evaluate(graph, placed)
 
-    # Cross-check: the engine's own booked loads must match what we just scored.
-    booked_max = engine.fabric_utilization_summary()["max_utilization"]
-    if not math.isclose(booked_max, metrics.max_utilization, rel_tol=1e-9, abs_tol=1e-9):
-        raise AssertionError(
-            f"Engine booked max utilization {booked_max:.6f} != scored {metrics.max_utilization:.6f}"
-        )
+    placed: list[PlacedFlow] = []
+    load: dict[Edge, float] = defaultdict(float)
+    channels_by_edge: dict[Edge, list[int]] = defaultdict(list)
+    for index, route in routes.items():
+        if not route.routed:
+            continue
+        placed.append(PlacedFlow(route.path, flows[index].traffic_volume_gbits, route.demand_gbps))
+        for hop in route.hops:
+            edge = (hop.source, hop.destination)
+            load[edge] += route.demand_gbps
+            channels_by_edge[edge].extend(hop.channels)
 
+    # Integrity checks: the engine must never double-book a wavelength, and what it
+    # reported must match what it actually booked on the graph.
+    for edge, channels in channels_by_edge.items():
+        if len(channels) != len(set(channels)):
+            raise AssertionError(f"Engine double-booked a wavelength on {edge}")
+    for u, v, attrs in graph.edges(data=True):
+        if not math.isclose(attrs["current_load"], load.get((u, v), 0.0), abs_tol=1e-6):
+            raise AssertionError(f"Engine load mismatch on {(u, v)}")
+        if attrs["booked_channels"] != set(channels_by_edge.get((u, v), ())):
+            raise AssertionError(f"Engine wavelength mismatch on {(u, v)}")
+
+    temps = engine.get_switch_temperatures()  # a fresh copy, safe to keep after reset
+    failed = sum(1 for route in routes.values() if not route.routed)
     engine.reset_fabric_load()  # leave the fabric clean for the next run
-    return metrics
+    return RunResult(placed=placed, load=dict(load), temps=temps, failed_flows=failed)
 
 
 # --------------------------------------------------------------------------- #
@@ -254,29 +336,45 @@ WORKLOADS: tuple[WorkloadSpec, ...] = (
 # --------------------------------------------------------------------------- #
 # Benchmark driver
 # --------------------------------------------------------------------------- #
+def exceeds_gpu_port(graph: nx.DiGraph, flows: Sequence[Flow], sync_window_s: float) -> bool:
+    """True if any single flow is larger than its source GPU's access link."""
+    for flow in flows:
+        port_gbps = max(
+            graph.edges[flow.source_gpu, neighbour]["bandwidth_gbps"]
+            for neighbour in graph.successors(flow.source_gpu)
+        )
+        if flow.traffic_volume_gbits / sync_window_s > port_gbps + EPSILON:
+            return True
+    return False
+
+
 def benchmark_workload(
     spec: WorkloadSpec,
     generator: AIWorkloadGenerator,
     ecmp: ECMPRouter,
     engine: OpticalRoutingEngine,
-    graph: nx.DiGraph,
+    physics: PhysicsModel,
     tensor_sizes_gb: Sequence[float],
     trials: int,
     seed: int,
 ) -> list[SweepRow]:
+    graph = engine.graph
     rows: list[SweepRow] = []
     for size_gb in tensor_sizes_gb:
         flows = spec.builder(generator, size_gb)
 
         ecmp_runs = [
-            evaluate(graph, ecmp.route(flows, random.Random(seed + trial)))
+            evaluate(graph, ecmp.route(flows, random.Random(seed + trial)), physics, len(flows))
             for trial in range(trials)
         ]
+        engine_metrics = evaluate(graph, run_engine(engine, flows), physics, len(flows))
+
         rows.append(
             SweepRow(
                 tensor_size_gb=size_gb,
                 ecmp=mean_metrics(ecmp_runs),
-                engine=run_engine(engine, graph, flows),
+                engine=engine_metrics,
+                port_limited=exceeds_gpu_port(graph, flows, physics.sync_window_s),
             )
         )
     return rows
@@ -285,14 +383,29 @@ def benchmark_workload(
 # --------------------------------------------------------------------------- #
 # Dashboard
 # --------------------------------------------------------------------------- #
-_WIDTH = 108
+_WIDTH = 118
+_SEP = "  |  "
 
 
-def _first_overload(rows: Sequence[SweepRow], pick: Callable[[SweepRow], Metrics]) -> str:
+def _fmt_ns(value: float) -> str:
+    return "n/a" if math.isnan(value) else f"{value:,.1f}"
+
+
+def _fmt_gain(ecmp_ns: float, engine_ns: float) -> str:
+    if math.isnan(ecmp_ns) or math.isnan(engine_ns) or ecmp_ns <= 0:
+        return "n/a"
+    return f"{(ecmp_ns - engine_ns) / ecmp_ns * 100.0:+.1f}%"
+
+
+def _row_notes(row: SweepRow) -> str:
+    return ("A" if row.engine.failed_flows > 0 else "") + ("B" if row.port_limited else "")
+
+
+def _first_size(rows: Sequence[SweepRow], predicate: Callable[[SweepRow], bool]) -> str:
     for row in rows:
-        if pick(row).overloaded_links > 0:
+        if predicate(row):
             return f"{row.tensor_size_gb:.0f} GB"
-    return "not reached in sweep"
+    return "not reached"
 
 
 def print_dashboard(
@@ -300,61 +413,88 @@ def print_dashboard(
     k: int,
     gpu_count: int,
     trials: int,
-    sync_window_s: float,
+    physics: PhysicsModel,
 ) -> None:
     bar = "=" * _WIDTH
     print(f"\n{bar}")
-    print("  ECMP vs. OPTICAL ROUTING ENGINE - BENCHMARK DASHBOARD".center(_WIDTH))
+    print("  ECMP vs. PHYSICS-AWARE OPTICAL ROUTING ENGINE - PHYSICS & PERFORMANCE DASHBOARD".center(_WIDTH))
     print(bar)
     print(
-        f"  Fat-Tree k={k} | {gpu_count} GPUs | ECMP = mean of {trials} seeded trials | "
-        f"sync window {sync_window_s:g} s"
+        f"  Fat-Tree k={k} | {gpu_count} GPUs | identical flows and order for both routers | "
+        f"ECMP = mean of {trials} seeded trials"
     )
     print(
-        f"  Latency model: base + util x {SERIALIZATION_PENALTY_NS:g} ns, "
-        f"+ {SERIALIZATION_PENALTY_NS:g} ns x (exp({OVERLOAD_STEEPNESS:g} x overload) - 1) when util > 100%"
+        f"  Physics: heating {physics.heating_c_per_gbps:g} C/Gbps (cap 85 C) | throttle at >= "
+        f"{THROTTLE_TEMP_C:.0f} C | thermal penalty {physics.thermal_penalty_ns_per_c:g} ns/C per switch | "
+        f"sync window {physics.sync_window_s:g} s"
+    )
+    print(
+        f"  Latency = base + congestion ({physics.serialization_penalty_ns:g} ns x utilization, "
+        f"exponential above 100%) + thermal"
     )
 
     for spec in WORKLOADS:
         rows = results[spec.name]
+        flow_count = rows[0].ecmp.total_flows
         print(f"\n{'-' * _WIDTH}")
         print(f"  WORKLOAD: {spec.name} - {spec.description}")
         print("-" * _WIDTH)
+
         print(
-            f"  {'Tensor':>6}  {'Total Volume':>13}  |  {'Overloaded Links':^17}  |  "
-            f"{'Avg Packet Latency (ns)':^33}  |  {'Max Link Util':^17}"
+            f"  {'Tensor':>6}{_SEP}{'Blocked/Collided':^17}{_SEP}"
+            f"{f'Switches >= {THROTTLE_TEMP_C:.0f} C':^17}{_SEP}{'Peak Temp (C)':^17}{_SEP}"
+            f"{'Avg Effective Latency (ns)':^30}{_SEP}{'Notes':<5}"
+        )
+        pair = f"{'ECMP':>8} {'Engine':>8}"
+        print(
+            f"  {'(GB)':>6}{_SEP}{pair}{_SEP}{pair}{_SEP}{pair}{_SEP}"
+            f"{'ECMP':>10} {'Engine':>10} {'Gain':>8}{_SEP}{'':<5}"
         )
         print(
-            f"  {'(GB)':>6}  {'(Gbit)':>13}  |  {'ECMP':>8} {'Engine':>8}  |  "
-            f"{'ECMP':>10} {'Engine':>10} {'Gain':>9}  |  {'ECMP':>8} {'Engine':>8}"
+            f"  {'-' * 6}{_SEP}{'-' * 17}{_SEP}{'-' * 17}{_SEP}{'-' * 17}{_SEP}{'-' * 30}{_SEP}{'-' * 5}"
         )
-        print(f"  {'-' * 6}  {'-' * 13}  |  {'-' * 17}  |  {'-' * 33}  |  {'-' * 17}")
 
         for row in rows:
-            gain = (
-                (row.ecmp.avg_latency_ns - row.engine.avg_latency_ns)
-                / row.ecmp.avg_latency_ns
-                * 100.0
-                if row.ecmp.avg_latency_ns
-                else 0.0
-            )
             print(
-                f"  {row.tensor_size_gb:>6.0f}  {row.ecmp.total_volume_gbits:>13,.0f}  |  "
-                f"{row.ecmp.overloaded_links:>8.1f} {row.engine.overloaded_links:>8.1f}  |  "
-                f"{row.ecmp.avg_latency_ns:>10,.1f} {row.engine.avg_latency_ns:>10,.1f} {gain:>+8.1f}%  |  "
-                f"{row.ecmp.max_utilization * 100:>7.1f}% {row.engine.max_utilization * 100:>7.1f}%"
+                f"  {row.tensor_size_gb:>6.0f}{_SEP}"
+                f"{row.ecmp.failed_flows:>8.1f} {row.engine.failed_flows:>8.1f}{_SEP}"
+                f"{row.ecmp.hot_switches:>8.2f} {row.engine.hot_switches:>8.2f}{_SEP}"
+                f"{row.ecmp.peak_temp_c:>8.1f} {row.engine.peak_temp_c:>8.1f}{_SEP}"
+                f"{_fmt_ns(row.ecmp.avg_latency_ns):>10} {_fmt_ns(row.engine.avg_latency_ns):>10} "
+                f"{_fmt_gain(row.ecmp.avg_latency_ns, row.engine.avg_latency_ns):>8}{_SEP}"
+                f"{_row_notes(row):<5}"
             )
 
-        print(f"\n  ECMP first overloads a link at:   {_first_overload(rows, lambda r: r.ecmp)}")
-        print(f"  Engine first overloads a link at: {_first_overload(rows, lambda r: r.engine)}")
+        print(f"\n  Failed-flow counts are out of {flow_count} flows per run.")
+        print(
+            f"  First failed flow:      ECMP at {_first_size(rows, lambda r: r.ecmp.failed_flows > 0)}"
+            f" (in any trial) | Engine at {_first_size(rows, lambda r: r.engine.failed_flows > 0)}"
+        )
+        print(
+            f"  First thermal throttle: ECMP at {_first_size(rows, lambda r: r.ecmp.hot_switches > 0)}"
+            f" (in any trial) | Engine at {_first_size(rows, lambda r: r.engine.hot_switches > 0)}"
+        )
+        if any("A" in _row_notes(r) for r in rows):
+            print(
+                "  A = the engine blocked some flows. Its temperature and latency cover routed flows only,"
+                " and blocked traffic generates no heat."
+            )
+        if any(r.port_limited for r in rows):
+            print(
+                "  B = a single flow exceeds its GPU's access link, so no router can carry it cleanly."
+                " Compare those rows by failed flows, not latency."
+            )
 
     print(f"\n{bar}")
     print("  Notes")
-    print("   - Overloaded = directed link with booked demand above its bandwidth. Flows are")
-    print("     unsplittable, so a link that every path must cross (e.g. a GPU's own access link),")
-    print("     or one that a single flow already exceeds, overloads under both routers.")
-    print("   - Latency is scored by one shared model for both routers, not by the engine's")
-    print("     internal selection-time estimate.")
+    print("   - Blocked/Collided: ECMP counts flows that collided when booked (needed more wavelengths")
+    print("     than were free, or overbooked a copper link). The engine counts flows it blocked.")
+    print("   - Heating: both routers use the same model; ECMP heats for every flow it sends,")
+    print("     including collided ones. Temperatures are the final state after all flows, and")
+    print("     every ECMP figure in the tables is a mean across trials.")
+    print("   - Latency: volume-weighted over delivered flows, scored after placement by one shared")
+    print("     model. ECMP delivers every flow; the engine delivers the flows it routed.")
+    print("   - Thermal constants are model parameters, not measured hardware values.")
     print(bar)
 
 
@@ -362,11 +502,19 @@ def print_dashboard(
 # Entry point
 # --------------------------------------------------------------------------- #
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Benchmark ECMP vs. OpticalRoutingEngine.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark blind ECMP vs. the physics-aware OpticalRoutingEngine."
+    )
     parser.add_argument("--k", type=int, default=4, help="Fat-Tree switch port count (even, >= 4)")
     parser.add_argument("--trials", type=int, default=50, help="seeded ECMP trials to average")
     parser.add_argument("--seed", type=int, default=2026, help="base seed for ECMP trials")
     parser.add_argument("--window", type=float, default=1.0, help="sync window in seconds")
+    parser.add_argument(
+        "--heating",
+        type=float,
+        default=None,
+        help="switch heating in C per Gbps (default: the engine's own default)",
+    )
     args = parser.parse_args(argv)
 
     if args.k < 4 or args.k % 2:
@@ -375,28 +523,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--trials must be at least 1")
     if args.window <= 0:
         parser.error("--window must be positive")
+    if args.heating is not None and args.heating < 0:
+        parser.error("--heating must not be negative")
 
     with contextlib.redirect_stdout(io.StringIO()):  # silence the topology's build message
         topology = FatTreeTopology(k=args.k)
 
+    engine_kwargs: dict[str, float] = {"sync_window_s": args.window}
+    if args.heating is not None:
+        engine_kwargs["heating_c_per_gbps"] = args.heating
+    engine = OpticalRoutingEngine(topology, **engine_kwargs)
+
+    physics = PhysicsModel.from_engine(engine)
     generator = AIWorkloadGenerator(topology)
-    ecmp = ECMPRouter(topology, sync_window_s=args.window)
-    engine = OpticalRoutingEngine(
-        topology,
-        serialization_penalty_ns=SERIALIZATION_PENALTY_NS,
-        sync_window_s=args.window,
-    )
+    ecmp = ECMPRouter(topology.graph, physics)
 
     results = {
         spec.name: benchmark_workload(
-            spec,
-            generator,
-            ecmp,
-            engine,
-            topology.graph,
-            TENSOR_SIZES_GB,
-            trials=args.trials,
-            seed=args.seed,
+            spec, generator, ecmp, engine, physics, TENSOR_SIZES_GB, args.trials, args.seed
         )
         for spec in WORKLOADS
     }
@@ -406,7 +550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         k=args.k,
         gpu_count=len(generator.get_gpu_nodes()),
         trials=args.trials,
-        sync_window_s=args.window,
+        physics=physics,
     )
     return 0
 
