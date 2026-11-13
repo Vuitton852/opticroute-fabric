@@ -31,13 +31,20 @@ Shared scoring (computed after all flows are placed, from the final fabric state
     for ECMP (collided ones included), routed flows only for the engine.
 
 Both routers use the engine's own heating, thermal-penalty and serialization settings.
-Two workloads are swept over 10-50 GB tensors: Ring All-Reduce and Cross-Pod Shift.
+Three workloads are swept over 10-50 GB tensors: Ring All-Reduce, Cross-Pod Shift and a
+Mixture-of-Experts (MoE) All-to-All token dispatch with skewed expert popularity.
+
+Unavoidable failures
+    GPU access links have a fixed capacity, so some flows cannot be carried by any router
+    (a flow bigger than the link, or MoE traffic converging on a hot expert). Each row's
+    floor is a lower bound on failed flows for any router, computed from those limits.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import io
 import math
 import random
@@ -70,6 +77,8 @@ MAX_OVERLOAD_EXCESS = 10.0  # cap on (utilization - 1) inside expm1(), avoids ov
 EPSILON = 1e-9
 BITS_PER_BYTE = 8
 SWITCH_TYPES = frozenset({"core", "aggregation", "edge"})
+MOE_TOP_K = 2  # experts each GPU dispatches to in the MoE workload
+MOE_SEED = 42  # seeds MoE expert popularity, expert selection and gate weights
 
 Edge = tuple[str, str]
 
@@ -131,7 +140,11 @@ class SweepRow:
     tensor_size_gb: float
     ecmp: Metrics  # mean across ECMP trials
     engine: Metrics
-    port_limited: bool  # a single flow exceeds its GPU's access link
+    unavoidable_failed: int  # lower bound on failed flows for any router (GPU port limits)
+
+    @property
+    def port_limited(self) -> bool:
+        return self.unavoidable_failed > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,33 +332,91 @@ def build_cross_pod_shift(generator: AIWorkloadGenerator, tensor_size_gb: float)
     ]
 
 
-WORKLOADS: tuple[WorkloadSpec, ...] = (
-    WorkloadSpec(
-        name="Ring All-Reduce",
-        description="16-GPU ring sync; each GPU sends 2(N-1)/N x tensor to its successor",
-        builder=build_ring_all_reduce,
-    ),
-    WorkloadSpec(
-        name="Cross-Pod Shift",
-        description="every GPU sends one full tensor to its peer in the next pod",
-        builder=build_cross_pod_shift,
-    ),
-)
+def build_moe_all_to_all(
+    generator: AIWorkloadGenerator,
+    tensor_size_gb: float,
+    top_k_experts: int = MOE_TOP_K,
+    seed: int = MOE_SEED,
+) -> list[Flow]:
+    """Skewed MoE token dispatch: each GPU sends `tensor_size_gb` to its top-k experts in other pods."""
+    return generator.generate_moe_all_to_all_traffic(
+        tensor_size_gb, top_k_experts=top_k_experts, seed=seed
+    )
+
+
+def build_workloads(moe_seed: int = MOE_SEED) -> tuple[WorkloadSpec, ...]:
+    """The benchmark's workloads. The MoE hot-spot layout depends on `moe_seed`."""
+    return (
+        WorkloadSpec(
+            name="Ring All-Reduce",
+            description="16-GPU ring sync; each GPU sends 2(N-1)/N x tensor to its successor",
+            builder=build_ring_all_reduce,
+        ),
+        WorkloadSpec(
+            name="Cross-Pod Shift",
+            description="every GPU sends one full tensor to its peer in the next pod",
+            builder=build_cross_pod_shift,
+        ),
+        WorkloadSpec(
+            name="MoE All-to-All",
+            description=(
+                f"Top-{MOE_TOP_K} experts, skewed dispatch (seed {moe_seed}): every GPU sends its "
+                f"tensor to {MOE_TOP_K} popular expert GPUs in other pods"
+            ),
+            builder=functools.partial(build_moe_all_to_all, seed=moe_seed),
+        ),
+    )
+
+
+WORKLOADS: tuple[WorkloadSpec, ...] = build_workloads()
 
 
 # --------------------------------------------------------------------------- #
 # Benchmark driver
 # --------------------------------------------------------------------------- #
-def exceeds_gpu_port(graph: nx.DiGraph, flows: Sequence[Flow], sync_window_s: float) -> bool:
-    """True if any single flow is larger than its source GPU's access link."""
+def min_unavoidable_failures(graph: nx.DiGraph, flows: Sequence[Flow], sync_window_s: float) -> int:
+    """
+    Lower bound on the flows that no router can carry.
+
+    A GPU's access link has a fixed capacity, so the flows a GPU sends (or receives) must
+    fit inside it. The fewest flows to drop from a set of demands is found by dropping the
+    largest first. Flows partition by source and by destination, so the per-GPU counts add
+    up; the larger of the two totals is the bound. Both ECMP's collided flows and the
+    engine's blocked flows are counted against the same link limits, so neither can fall
+    below it.
+    """
+
+    def fewest_drops(demands: list[float], capacity_gbps: float) -> int:
+        remaining = sum(demands)
+        drops = 0
+        for demand in sorted(demands, reverse=True):
+            if remaining <= capacity_gbps + EPSILON:
+                break
+            remaining -= demand
+            drops += 1
+        return drops
+
+    sent: dict[str, list[float]] = defaultdict(list)
+    received: dict[str, list[float]] = defaultdict(list)
     for flow in flows:
-        port_gbps = max(
-            graph.edges[flow.source_gpu, neighbour]["bandwidth_gbps"]
-            for neighbour in graph.successors(flow.source_gpu)
-        )
-        if flow.traffic_volume_gbits / sync_window_s > port_gbps + EPSILON:
-            return True
-    return False
+        demand = flow.traffic_volume_gbits / sync_window_s
+        sent[flow.source_gpu].append(demand)
+        received[flow.destination_gpu].append(demand)
+
+    egress = sum(
+        fewest_drops(demands, max(graph.edges[gpu, n]["bandwidth_gbps"] for n in graph.successors(gpu)))
+        for gpu, demands in sent.items()
+    )
+    ingress = sum(
+        fewest_drops(demands, max(graph.edges[p, gpu]["bandwidth_gbps"] for p in graph.predecessors(gpu)))
+        for gpu, demands in received.items()
+    )
+    return max(egress, ingress)
+
+
+def exceeds_gpu_port(graph: nx.DiGraph, flows: Sequence[Flow], sync_window_s: float) -> bool:
+    """True if GPU access-link limits make some flow undeliverable for any router."""
+    return min_unavoidable_failures(graph, flows, sync_window_s) > 0
 
 
 def benchmark_workload(
@@ -374,7 +445,7 @@ def benchmark_workload(
                 tensor_size_gb=size_gb,
                 ecmp=mean_metrics(ecmp_runs),
                 engine=engine_metrics,
-                port_limited=exceeds_gpu_port(graph, flows, physics.sync_window_s),
+                unavoidable_failed=min_unavoidable_failures(graph, flows, physics.sync_window_s),
             )
         )
     return rows
@@ -414,6 +485,7 @@ def print_dashboard(
     gpu_count: int,
     trials: int,
     physics: PhysicsModel,
+    workloads: Sequence[WorkloadSpec] = WORKLOADS,
 ) -> None:
     bar = "=" * _WIDTH
     print(f"\n{bar}")
@@ -433,7 +505,7 @@ def print_dashboard(
         f"exponential above 100%) + thermal"
     )
 
-    for spec in WORKLOADS:
+    for spec in workloads:
         rows = results[spec.name]
         flow_count = rows[0].ecmp.total_flows
         print(f"\n{'-' * _WIDTH}")
@@ -455,17 +527,23 @@ def print_dashboard(
         )
 
         for row in rows:
+            gain = _fmt_gain(row.ecmp.avg_latency_ns, row.engine.avg_latency_ns)
+            if gain != "n/a" and row.engine.failed_flows > 0:
+                gain += "*"  # engine latency covers fewer flows than ECMP's
             print(
                 f"  {row.tensor_size_gb:>6.0f}{_SEP}"
                 f"{row.ecmp.failed_flows:>8.1f} {row.engine.failed_flows:>8.1f}{_SEP}"
                 f"{row.ecmp.hot_switches:>8.2f} {row.engine.hot_switches:>8.2f}{_SEP}"
                 f"{row.ecmp.peak_temp_c:>8.1f} {row.engine.peak_temp_c:>8.1f}{_SEP}"
                 f"{_fmt_ns(row.ecmp.avg_latency_ns):>10} {_fmt_ns(row.engine.avg_latency_ns):>10} "
-                f"{_fmt_gain(row.ecmp.avg_latency_ns, row.engine.avg_latency_ns):>8}{_SEP}"
+                f"{gain:>8}{_SEP}"
                 f"{_row_notes(row):<5}"
             )
 
         print(f"\n  Failed-flow counts are out of {flow_count} flows per run.")
+        if any(r.port_limited for r in rows):
+            floors = " | ".join(f"{r.tensor_size_gb:.0f} GB: {r.unavoidable_failed}" for r in rows)
+            print(f"  Unavoidable failures (GPU port limits, any router): {floors}")
         print(
             f"  First failed flow:      ECMP at {_first_size(rows, lambda r: r.ecmp.failed_flows > 0)}"
             f" (in any trial) | Engine at {_first_size(rows, lambda r: r.engine.failed_flows > 0)}"
@@ -479,11 +557,13 @@ def print_dashboard(
                 "  A = the engine blocked some flows. Its temperature and latency cover routed flows only,"
                 " and blocked traffic generates no heat."
             )
+            print("      A gain marked * compares the engine's routed flows with all of ECMP's flows.")
         if any(r.port_limited for r in rows):
             print(
-                "  B = a single flow exceeds its GPU's access link, so no router can carry it cleanly."
-                " Compare those rows by failed flows, not latency."
+                "  B = GPU port limits (a flow, or traffic converging on one GPU, exceeds its access link):"
+                " some flows can't be carried by any router."
             )
+            print("      Compare those rows by failed flows against the unavoidable floor, not by latency.")
 
     print(f"\n{bar}")
     print("  Notes")
@@ -494,6 +574,9 @@ def print_dashboard(
     print("     every ECMP figure in the tables is a mean across trials.")
     print("   - Latency: volume-weighted over delivered flows, scored after placement by one shared")
     print("     model. ECMP delivers every flow; the engine delivers the flows it routed.")
+    print("   - Unavoidable failures: a lower bound set by GPU access-link capacity. No router's failed-flow")
+    print("     count can fall below it, so only the excess over the floor reflects routing quality.")
+    print("   - MoE hot-spots depend on the --moe-seed layout; try several seeds before drawing conclusions.")
     print("   - Thermal constants are model parameters, not measured hardware values.")
     print(bar)
 
@@ -514,6 +597,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=None,
         help="switch heating in C per Gbps (default: the engine's own default)",
+    )
+    parser.add_argument(
+        "--moe-seed",
+        type=int,
+        default=MOE_SEED,
+        help="seed for the MoE workload's expert popularity and selection",
     )
     args = parser.parse_args(argv)
 
@@ -538,11 +627,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     generator = AIWorkloadGenerator(topology)
     ecmp = ECMPRouter(topology.graph, physics)
 
+    workloads = build_workloads(args.moe_seed)
     results = {
         spec.name: benchmark_workload(
             spec, generator, ecmp, engine, physics, TENSOR_SIZES_GB, args.trials, args.seed
         )
-        for spec in WORKLOADS
+        for spec in workloads
     }
 
     print_dashboard(
@@ -551,6 +641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_count=len(generator.get_gpu_nodes()),
         trials=args.trials,
         physics=physics,
+        workloads=workloads,
     )
     return 0
 
