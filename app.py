@@ -19,15 +19,18 @@ third-party package that ships a top-level `tests` module cannot shadow it.
 from __future__ import annotations
 
 import contextlib
+import csv
 import importlib.util
 import inspect
 import io
+import json
 import math
 import random
 import statistics
 import sys
+import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,11 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+try:  # PyYAML is optional: without it, flat key: value YAML files still load.
+    import yaml
+except ImportError:  # pragma: no cover - depends on the environment
+    yaml = None
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -111,6 +119,58 @@ THRESHOLD_COLOR = "#D62728"
 STATE_KEY = "cosim_result"
 _EPSILON = 1e-9
 
+# Hardware profile ---------------------------------------------------------- #
+_HARDWARE_DEFAULTS: dict[str, Any] = {
+    name: inspect.signature(FatTreeTopology.__init__).parameters[name].default
+    for name in (
+        "core_wdm_channels",
+        "agg_wdm_channels",
+        "channel_bandwidth_gbps",
+        "core_insertion_loss_db",
+        "agg_insertion_loss_db",
+        "gpu_bandwidth_gbps",
+    )
+}
+MAX_PROFILE_K = 12  # dashboard limit so a run stays interactive (k=12 is 432 GPUs)
+MAX_PROFILE_BYTES = 64 * 1024
+PROFILE_EXTENSIONS: tuple[str, ...] = ("yaml", "yml", "json")
+SAMPLE_PROFILE_FILENAME = "opticroute_hardware_spec.yaml"
+
+
+@dataclass(frozen=True, slots=True)
+class HardwareProfile:
+    """Link hardware for the fabric. The defaults are the original reference fabric."""
+
+    name: str | None = None
+    k: int | None = None  # None: use the sidebar's cluster scale
+    core_wdm_channels: int = _HARDWARE_DEFAULTS["core_wdm_channels"]
+    agg_wdm_channels: int = _HARDWARE_DEFAULTS["agg_wdm_channels"]
+    channel_bandwidth_gbps: float = _HARDWARE_DEFAULTS["channel_bandwidth_gbps"]
+    core_insertion_loss_db: float = _HARDWARE_DEFAULTS["core_insertion_loss_db"]
+    agg_insertion_loss_db: float = _HARDWARE_DEFAULTS["agg_insertion_loss_db"]
+    gpu_bandwidth_gbps: float = _HARDWARE_DEFAULTS["gpu_bandwidth_gbps"]
+
+    def topology_kwargs(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in _HARDWARE_DEFAULTS}
+
+    def label(self, k: int) -> str:
+        """Short text for captions and the CSV report."""
+        text = self.summary(f"k={k}")
+        return f"{self.name}: {text}" if self.name else text
+
+    def summary(self, k_text: str) -> str:
+        if self.core_wdm_channels == self.agg_wdm_channels:
+            channels = f"{self.core_wdm_channels} WDM ch"
+        else:
+            channels = f"{self.core_wdm_channels} core / {self.agg_wdm_channels} agg WDM ch"
+        return (
+            f"{k_text} | {channels} @ {self.channel_bandwidth_gbps:g} Gbps "
+            f"| {self.gpu_bandwidth_gbps:g} Gbps GPU link"
+        )
+
+
+DEFAULT_HARDWARE = HardwareProfile()
+
 HOP_COLUMNS = [
     "Flow", "Source", "Destination", "Hop", "Link", "Link tier",
     "Wavelength channels", "Channels", "Reserved (Gbps)", "Hop loss (dB)",
@@ -163,6 +223,7 @@ class SimParams:
     seed: int
     top_k_experts: int = DEFAULT_TOP_K  # used by MoE All-to-All only
     moe_seed: int = DEFAULT_MOE_SEED  # used by MoE All-to-All only
+    hardware: HardwareProfile = DEFAULT_HARDWARE  # k above is the effective cluster scale
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +266,203 @@ class CoSimResult:
     wdm_channels_booked: int
     wdm_channels_total: int
     elapsed_s: float
+
+
+# --------------------------------------------------------------------------- #
+# Hardware profiles (YAML / JSON)
+# --------------------------------------------------------------------------- #
+def sample_profile_yaml() -> str:
+    """A clean YAML template with the reference hardware, ready to edit."""
+    d = _HARDWARE_DEFAULTS
+    return (
+        "# OpticRoute Fabric - hardware profile\n"
+        "# Every setting is optional; a missing setting uses the reference value shown here.\n"
+        "# If k is present it sets the cluster scale (an even number, 2 to "
+        f"{MAX_PROFILE_K} in this dashboard).\n"
+        "name: Reference profile\n"
+        "k: 4\n"
+        "\n"
+        "# Wavelengths per optical link, and the capacity of one wavelength\n"
+        f"core_wdm_channels: {d['core_wdm_channels']}   # aggregation <-> core links\n"
+        f"agg_wdm_channels: {d['agg_wdm_channels']}    # edge <-> aggregation links\n"
+        f"channel_bandwidth_gbps: {d['channel_bandwidth_gbps']:g}\n"
+        "\n"
+        "# Insertion loss of each optical link, in dB\n"
+        f"core_insertion_loss_db: {d['core_insertion_loss_db']:g}\n"
+        f"agg_insertion_loss_db: {d['agg_insertion_loss_db']:g}\n"
+        "\n"
+        "# GPU <-> edge link: a single lane, no WDM\n"
+        f"gpu_bandwidth_gbps: {d['gpu_bandwidth_gbps']:g}\n"
+    )
+
+
+_SCALAR_INT = re.compile(r"[+-]?\d+")
+_SCALAR_FLOAT = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?")
+
+
+def _flat_yaml_scalar(text: str) -> Any:
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    lowered = text.lower()
+    if lowered in ("", "null", "~"):
+        return None
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if _SCALAR_INT.fullmatch(text):
+        return int(text)
+    if _SCALAR_FLOAT.fullmatch(text):
+        return float(text)
+    return text
+
+
+def _parse_flat_yaml(text: str) -> dict[str, Any]:
+    """Minimal parser for flat `key: value` YAML, used only when PyYAML is not installed."""
+    result: dict[str, Any] = {}
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#") or line in ("---", "..."):
+            continue
+        if raw.startswith((" ", "\t")) or line.startswith("- ") or ":" not in line:
+            raise ValueError(
+                f"Line {number}: only flat 'key: value' lines are supported without PyYAML "
+                "(install it with: pip install pyyaml)"
+            )
+        key, _, value = line.partition(":")
+        value = value.strip()
+        if value.startswith(('"', "'")):
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end == -1:
+                raise ValueError(f"Line {number}: unterminated quoted value")
+            value = value[: end + 1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        key = key.strip()
+        if key in result:
+            raise ValueError(f"Line {number}: duplicate setting {key!r}")
+        result[key] = _flat_yaml_scalar(value)
+    return result
+
+
+def parse_hardware_profile(filename: str, raw: bytes) -> HardwareProfile:
+    """
+    Parse and validate an uploaded profile. Raises ValueError with a message meant for
+    the user. Validation is FatTreeTopology.validate_config, so the dashboard and the
+    topology always agree on what a valid profile is.
+    """
+    if len(raw) > MAX_PROFILE_BYTES:
+        raise ValueError(f"The file is larger than {MAX_PROFILE_BYTES // 1024} KB")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("The file is not UTF-8 text") from exc
+
+    extension = Path(filename).suffix.lower().lstrip(".")
+    if extension not in PROFILE_EXTENSIONS:
+        raise ValueError("Use a .yaml, .yml or .json file")
+    try:
+        if extension == "json":
+            data = json.loads(text)
+        elif yaml is not None:
+            data = yaml.safe_load(text)
+        else:
+            data = _parse_flat_yaml(text)
+    except ValueError:  # includes json.JSONDecodeError
+        raise
+    except Exception as exc:  # yaml.YAMLError and friends
+        mark = getattr(exc, "problem_mark", None)
+        problem = getattr(exc, "problem", None) or (str(exc).splitlines() or ["unreadable"])[0]
+        where = f" (line {mark.line + 1})" if mark is not None else ""
+        raise ValueError(f"Could not parse the file{where}: {problem}") from exc
+
+    if data is None:
+        raise ValueError("The file is empty")
+    if not isinstance(data, Mapping):
+        raise ValueError("The file must hold a mapping of settings (key: value pairs)")
+
+    clean = FatTreeTopology.validate_config(data)
+    k = clean.get("k")
+    if k is not None and k > MAX_PROFILE_K:
+        raise ValueError(f"k must be at most {MAX_PROFILE_K} in this dashboard, got {k}")
+    return HardwareProfile(
+        name=clean.get("name"),
+        k=k,
+        **{key: clean[key] for key in _HARDWARE_DEFAULTS if key in clean},
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Engineering report (CSV)
+# --------------------------------------------------------------------------- #
+REPORT_COLUMNS = [
+    "Workload", "Cluster k", "Tensor size (GB)", "Power budget (dB)", "Hardware profile",
+    "Status", "Flow", "Source", "Destination", "Hops", "Path", "Insertion loss (dB)",
+    "Peak switch temp (°C)", "WDM channels per optical link", "Block reason",
+]  # fmt: skip
+
+
+def _csv_safe(value: Any) -> Any:
+    """Stop spreadsheets from running text that starts with a formula character."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def build_report_csv(result: CoSimResult) -> bytes:
+    """
+    One row per flow from the engine run: routed path, insertion loss, peak switch
+    temperature and WDM channel allocations, or the reason the flow was blocked.
+    UTF-8 with a BOM so Excel shows the degree sign correctly.
+    """
+    params = result.params
+    context = [
+        params.workload,
+        params.k,
+        params.tensor_gb,
+        params.power_budget_db,
+        params.hardware.label(params.k),
+    ]
+    rows: list[tuple[int, list[Any]]] = []
+    for record in result.flow_table.to_dict("records"):
+        rows.append(
+            (
+                int(record["Flow"]),
+                [
+                    "Routed",
+                    record["Flow"],
+                    record["Source"],
+                    record["Destination"],
+                    record["Hops"],
+                    record["Path"],
+                    record["Insertion loss (dB)"],
+                    record["Peak switch temp (°C)"],
+                    record["WDM channels per optical link"],
+                    "",
+                ],
+            )
+        )
+    for record in result.blocked_table.to_dict("records"):
+        rows.append(
+            (
+                int(record["Flow"]),
+                ["Blocked", record["Flow"], record["Source"], record["Destination"], "", "", "", "", "", record["Reason"]],
+            )
+        )
+    rows.sort(key=lambda item: item[0])
+
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(REPORT_COLUMNS)
+    for _, values in rows:
+        writer.writerow([_csv_safe(value) for value in context + values])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def report_filename(params: SimParams) -> str:
+    workload = re.sub(r"[^a-z0-9]+", "_", params.workload.lower()).strip("_")
+    return f"opticroute_diagnostic_report_k{params.k}_{workload}_{params.tensor_gb}gb.csv"
 
 
 def format_channels(channels: Sequence[int]) -> str:
@@ -308,7 +566,7 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
     # A fresh topology and engine per run: the engine books load onto the graph, so
     # nothing is shared between runs or between browser sessions.
     with contextlib.redirect_stdout(io.StringIO()):  # silence the topology build message
-        topology = FatTreeTopology(k=params.k)
+        topology = FatTreeTopology(k=params.k, **params.hardware.topology_kwargs())
     graph = topology.graph
     engine = OpticalRoutingEngine(
         topology,
@@ -617,14 +875,53 @@ def render_header() -> None:
     st.markdown(_HEADER_CSS, unsafe_allow_html=True)
 
 
+def render_hardware_section() -> tuple[HardwareProfile, bool]:
+    """
+    Sidebar section for the custom hardware profile. Returns the profile to simulate and
+    whether the Run button may be used (False while an uploaded file is invalid).
+    """
+    st.subheader("Custom Hardware Spec (YAML / JSON)")
+    st.download_button(
+        "Download Sample Hardware YAML",
+        data=sample_profile_yaml(),
+        file_name=SAMPLE_PROFILE_FILENAME,
+        mime="text/yaml",
+        key="sample_profile_download",
+        help="A template with the reference hardware. Edit it and upload it below.",
+        **_stretch(st.download_button),
+    )
+    uploaded = st.file_uploader(
+        "Upload hardware profile",
+        type=list(PROFILE_EXTENSIONS),
+        key="hardware_profile_upload",
+        help=f"A .yaml, .yml or .json file of up to {MAX_PROFILE_BYTES // 1024} KB. "
+        "Every setting is optional; missing ones use the reference hardware.",
+    )
+    if uploaded is None:
+        st.caption("No file uploaded: simulating the reference hardware.")
+        return DEFAULT_HARDWARE, True
+
+    try:
+        profile = parse_hardware_profile(uploaded.name, uploaded.getvalue())
+    except ValueError as exc:
+        st.error(f"Invalid hardware profile ({uploaded.name}): {exc}")
+        st.caption("Fix the file and upload it again. Run Co-Simulation is disabled until then.")
+        return DEFAULT_HARDWARE, False
+
+    k_text = f"k={profile.k}" if profile.k is not None else "k from sidebar"
+    title = f" ({profile.name})" if profile.name else ""
+    st.success(f"Custom Profile Active{title}: {profile.summary(k_text)}")
+    st.caption(
+        f"Insertion loss: {profile.core_insertion_loss_db:g} dB per core link, "
+        f"{profile.agg_insertion_loss_db:g} dB per aggregation link."
+    )
+    return profile, True
+
+
 def render_sidebar() -> tuple[SimParams, bool]:
     with st.sidebar:
         st.header("Simulation controls")
-        k = st.selectbox(
-            "Cluster scale",
-            CLUSTER_SCALES,
-            format_func=lambda value: f"k = {value}  ({value**3 // 4} GPUs)",
-        )
+        scale_slot = st.container()  # filled in below, once the hardware profile is known
         workload = st.selectbox("Workload pattern", WORKLOAD_ORDER)
         top_k = DEFAULT_TOP_K
         if workload == MOE_WORKLOAD:
@@ -648,6 +945,22 @@ def render_sidebar() -> tuple[SimParams, bool]:
             help="The engine rejects any path whose total insertion loss exceeds this. "
             "Blind ECMP does not check it.",
         )
+        hardware, profile_ok = render_hardware_section()
+        with scale_slot:
+            if hardware.k is not None:
+                k = st.selectbox(
+                    "Cluster scale",
+                    (hardware.k,),
+                    format_func=lambda value: f"k = {value}  ({value**3 // 4} GPUs)",
+                    disabled=True,
+                    help="Set by the uploaded hardware profile.",
+                )
+            else:
+                k = st.selectbox(
+                    "Cluster scale",
+                    CLUSTER_SCALES,
+                    format_func=lambda value: f"k = {value}  ({value**3 // 4} GPUs)",
+                )
         with st.expander("Advanced model settings"):
             heating = st.number_input(
                 "Switch heating (°C per Gbps)",
@@ -672,7 +985,9 @@ def render_sidebar() -> tuple[SimParams, bool]:
                 )
             else:
                 moe_seed = DEFAULT_MOE_SEED
-        run_clicked = st.button("Run Co-Simulation", type="primary", **_stretch(st.button))
+        run_clicked = st.button(
+            "Run Co-Simulation", type="primary", disabled=not profile_ok, **_stretch(st.button)
+        )
         st.caption("Both routers receive identical flows in identical order.")
 
     params = SimParams(
@@ -685,8 +1000,9 @@ def render_sidebar() -> tuple[SimParams, bool]:
         seed=int(seed),
         top_k_experts=int(top_k),
         moe_seed=int(moe_seed),
+        hardware=hardware,
     )
-    return params, bool(run_clicked)
+    return params, bool(run_clicked) and profile_ok
 
 
 def _kpi_card(
@@ -769,8 +1085,9 @@ def render_floor(result: CoSimResult) -> None:
         "(lower bound for any router)"
     )
     st.caption(
-        "Each GPU has one 400 Gbps access link, so flows beyond what a source or destination GPU "
-        "can send or receive in the sync window fail no matter how they are routed. "
+        f"Each GPU has one {result.params.hardware.gpu_bandwidth_gbps:g} Gbps access link, so flows "
+        "beyond what a source or destination GPU can send or receive in the sync window fail no "
+        "matter how they are routed. "
         f"Avoidable fabric failures above this floor: {ENGINE_NAME} {_fmt_num(max(engine_extra, 0.0))}, "
         f"{ECMP_NAME} {_fmt_num(max(ecmp_extra, 0.0))} (mean of {trials} trials)."
     )
@@ -841,6 +1158,20 @@ def render_charts(result: CoSimResult) -> None:
 
 def render_inspector(result: CoSimResult) -> None:
     st.subheader("Optical wavelength & path inspector")
+    params = result.params
+    st.download_button(
+        "Download Engineering Diagnostic Report (CSV)",
+        data=build_report_csv(result),
+        file_name=report_filename(params),
+        mime="text/csv",
+        key="diagnostic_report_download",
+        help="One row per flow from the run shown below: routed path, insertion loss, peak "
+        "switch temperature and WDM channel allocations, or the reason a flow was blocked.",
+    )
+    st.caption(
+        f"The report covers the run shown here: {len(result.flow_table):,} routed and "
+        f"{len(result.blocked_table):,} blocked flows."
+    )
     with st.expander("Routed flows: path hops, insertion loss, peak temperature and WDM channels"):
         if result.flow_table.empty:
             st.write("The engine routed no flows with these settings.")
@@ -870,6 +1201,11 @@ def render_results(result: CoSimResult) -> None:
         if result.wdm_channels_total
         else 0.0
     )
+    hardware_text = (
+        f"custom hardware ({params.hardware.label(params.k)})"
+        if params.hardware != DEFAULT_HARDWARE
+        else "reference hardware"
+    )
     workload_text = (
         f"{params.workload} (top-{params.top_k_experts} experts)"
         if params.workload == MOE_WORKLOAD
@@ -878,7 +1214,7 @@ def render_results(result: CoSimResult) -> None:
     st.caption(
         f"k = {params.k} ({result.gpu_count} GPUs) · {workload_text} · {params.tensor_gb} GB "
         f"· {result.total_flows} flows · power budget {params.power_budget_db:.1f} dB "
-        f"· ran in {result.elapsed_s:.1f} s"
+        f"· {hardware_text} · ran in {result.elapsed_s:.1f} s"
     )
 
     render_kpis(result)

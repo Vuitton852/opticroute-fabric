@@ -21,15 +21,65 @@ Edge attributes (every physical link is two opposing directed edges)
 
 Each directed edge owns its own `booked_channels` set, so the two directions of a
 link allocate wavelengths independently.
+
+Hardware profile
+----------------
+The link hardware can be overridden with keyword arguments (or a config dict through
+`FatTreeTopology.from_config_dict`). The defaults reproduce the original fabric exactly:
+
+  core_wdm_channels         wavelengths on each aggregation <-> core link          (16)
+  agg_wdm_channels          wavelengths on each edge <-> aggregation link          (8)
+  channel_bandwidth_gbps    capacity of one wavelength on the optical links        (50.0)
+  core_insertion_loss_db    loss of each aggregation <-> core link                 (0.8)
+  agg_insertion_loss_db     loss of each edge <-> aggregation link                 (0.5)
+  gpu_bandwidth_gbps        GPU <-> edge copper link, one lane, no WDM             (400.0)
+
+Link bandwidth is always channels x channel bandwidth, so the two cannot disagree.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from typing import Any
 
 import networkx as nx
 
 SWITCH_TYPES: frozenset[str] = frozenset({"core", "aggregation", "edge"})
+
+# Sanity limits for hardware profiles. They catch typos (a 5000 dB loss, a negative
+# channel count); they are not physical limits of any particular product.
+MAX_WDM_CHANNELS = 1024
+MAX_CHANNEL_BANDWIDTH_GBPS = 10_000.0
+MAX_GPU_BANDWIDTH_GBPS = 100_000.0
+MAX_INSERTION_LOSS_DB = 100.0
+MAX_PROFILE_NAME_LENGTH = 80
+
+
+def _int_param(name: str, value: Any, lo: int, hi: int) -> int:
+    """Validate an integer parameter. Whole-number floats such as 16.0 are accepted."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a whole number, got {value!r}")
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+        raise ValueError(f"{name} must be a whole number, got {value!r}")
+    value = int(value)
+    if not lo <= value <= hi:
+        raise ValueError(f"{name} must be between {lo} and {hi}, got {value}")
+    return value
+
+
+def _float_param(name: str, value: Any, lo: float, hi: float, *, allow_zero: bool = False) -> float:
+    """Validate a real-valued parameter: finite, >0 (or >=0 when allow_zero), and <= hi."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    too_low = value < lo if allow_zero else value <= lo
+    if too_low or value > hi:
+        bound = f">= {lo:g}" if allow_zero else f"> {lo:g}"
+        raise ValueError(f"{name} must be {bound} and <= {hi:g}, got {value:g}")
+    return value
 
 
 class FatTreeTopology:
@@ -37,17 +87,63 @@ class FatTreeTopology:
     SWITCH_START_TEMP_C = 35.0
     SWITCH_MAX_TEMP_C = 85.0
 
-    def __init__(self, k: int = 4):
+    #: Keys accepted by `from_config_dict` (all optional; "name" is a free-text label).
+    CONFIG_KEYS: tuple[str, ...] = (
+        "name",
+        "k",
+        "core_wdm_channels",
+        "agg_wdm_channels",
+        "channel_bandwidth_gbps",
+        "core_insertion_loss_db",
+        "agg_insertion_loss_db",
+        "gpu_bandwidth_gbps",
+    )
+
+    def __init__(
+        self,
+        k: int = 4,
+        *,
+        core_wdm_channels: int = 16,
+        agg_wdm_channels: int = 8,
+        channel_bandwidth_gbps: float = 50.0,
+        core_insertion_loss_db: float = 0.8,
+        agg_insertion_loss_db: float = 0.5,
+        gpu_bandwidth_gbps: float = 400.0,
+    ):
         """
         Initializes a 3-Tier Fat-Tree Network Topology.
         :param k: The port count of the switches (determines cluster scale).
                   Total GPUs = (k^3) // 4. For k=4, that's 16 simulated GPUs.
                   Scale out to k=48 or higher for massive cluster limits.
+        :param core_wdm_channels: Wavelengths per aggregation <-> core optical link.
+        :param agg_wdm_channels: Wavelengths per edge <-> aggregation optical link.
+        :param channel_bandwidth_gbps: Capacity of one wavelength, in Gbps.
+        :param core_insertion_loss_db: Insertion loss of an aggregation <-> core link.
+        :param agg_insertion_loss_db: Insertion loss of an edge <-> aggregation link.
+        :param gpu_bandwidth_gbps: Capacity of the GPU <-> edge copper link.
+        The hardware parameters default to the original fabric, so `FatTreeTopology(k=4)`
+        behaves exactly as before. Invalid values raise ValueError.
         """
-        if k < 2 or k % 2:
-            raise ValueError(f"k must be an even integer >= 2, got {k}")
+        if isinstance(k, bool) or not isinstance(k, int) or k < 2 or k % 2:
+            raise ValueError(f"k must be an even integer >= 2, got {k!r}")
+
+        self.core_wdm_channels = _int_param("core_wdm_channels", core_wdm_channels, 1, MAX_WDM_CHANNELS)
+        self.agg_wdm_channels = _int_param("agg_wdm_channels", agg_wdm_channels, 1, MAX_WDM_CHANNELS)
+        self.channel_bandwidth_gbps = _float_param(
+            "channel_bandwidth_gbps", channel_bandwidth_gbps, 0.0, MAX_CHANNEL_BANDWIDTH_GBPS
+        )
+        self.core_insertion_loss_db = _float_param(
+            "core_insertion_loss_db", core_insertion_loss_db, 0.0, MAX_INSERTION_LOSS_DB, allow_zero=True
+        )
+        self.agg_insertion_loss_db = _float_param(
+            "agg_insertion_loss_db", agg_insertion_loss_db, 0.0, MAX_INSERTION_LOSS_DB, allow_zero=True
+        )
+        self.gpu_bandwidth_gbps = _float_param(
+            "gpu_bandwidth_gbps", gpu_bandwidth_gbps, 0.0, MAX_GPU_BANDWIDTH_GBPS
+        )
 
         self.k = k
+        self.profile_name: str | None = None  # set by from_config_dict
         self.graph = nx.DiGraph()  # Directed Graph representing two-way fabric paths
 
         # Calculate structure limits
@@ -57,6 +153,87 @@ class FatTreeTopology:
         self.gpus_per_edge_switch = k // 2
 
         self._build_network()
+
+    @classmethod
+    def validate_config(cls, config: Mapping[str, Any]) -> dict[str, Any]:
+        """
+        Validate a hardware-profile dict without building a fabric.
+
+        Returns a normalized dict that holds only the keys present in `config`: integers as
+        int, real values as float, "name" stripped of blanks (and dropped if empty). Unknown
+        keys, wrong types and out-of-range values raise ValueError naming the offending key.
+        """
+        if not isinstance(config, Mapping):
+            raise ValueError(f"The hardware profile must be a mapping of settings, got {type(config).__name__}")
+        bad_keys = [key for key in config if not isinstance(key, str)]
+        if bad_keys:
+            raise ValueError(f"Hardware profile keys must be text, got {bad_keys!r}")
+        unknown = sorted(set(config) - set(cls.CONFIG_KEYS))
+        if unknown:
+            raise ValueError(
+                f"Unknown hardware profile setting(s): {', '.join(unknown)}. "
+                f"Allowed settings: {', '.join(cls.CONFIG_KEYS)}"
+            )
+
+        clean: dict[str, Any] = {}
+        if "name" in config and config["name"] is not None:
+            name = config["name"]
+            if not isinstance(name, str):
+                raise ValueError(f"name must be text, got {name!r}")
+            name = name.strip()
+            if len(name) > MAX_PROFILE_NAME_LENGTH:
+                raise ValueError(f"name must be at most {MAX_PROFILE_NAME_LENGTH} characters")
+            if name:
+                clean["name"] = name
+        if "k" in config:
+            k = _int_param("k", config["k"], 2, 1_000_000)
+            if k % 2:
+                raise ValueError(f"k must be an even integer >= 2, got {k}")
+            clean["k"] = k
+        for key, lo, hi in (("core_wdm_channels", 1, MAX_WDM_CHANNELS), ("agg_wdm_channels", 1, MAX_WDM_CHANNELS)):
+            if key in config:
+                clean[key] = _int_param(key, config[key], lo, hi)
+        if "channel_bandwidth_gbps" in config:
+            clean["channel_bandwidth_gbps"] = _float_param(
+                "channel_bandwidth_gbps", config["channel_bandwidth_gbps"], 0.0, MAX_CHANNEL_BANDWIDTH_GBPS
+            )
+        for key in ("core_insertion_loss_db", "agg_insertion_loss_db"):
+            if key in config:
+                clean[key] = _float_param(key, config[key], 0.0, MAX_INSERTION_LOSS_DB, allow_zero=True)
+        if "gpu_bandwidth_gbps" in config:
+            clean["gpu_bandwidth_gbps"] = _float_param(
+                "gpu_bandwidth_gbps", config["gpu_bandwidth_gbps"], 0.0, MAX_GPU_BANDWIDTH_GBPS
+            )
+        return clean
+
+    @classmethod
+    def from_config_dict(cls, config: Mapping[str, Any]) -> FatTreeTopology:
+        """
+        Build a topology from a hardware-profile dict (for example parsed from YAML/JSON).
+
+        Every key is optional and falls back to the default hardware (k defaults to 4).
+        Accepted keys are listed in `CONFIG_KEYS`. Unknown keys, wrong types and out-of-range
+        values raise ValueError with a message that names the offending key.
+        """
+        clean = cls.validate_config(config)
+        name = clean.pop("name", None)
+        k = clean.pop("k", 4)
+        topology = cls(k=k, **clean)
+        topology.profile_name = name
+        return topology
+
+    @property
+    def hardware_profile(self) -> dict[str, Any]:
+        """The effective hardware settings of this fabric (a copy, safe to modify)."""
+        return {
+            "k": self.k,
+            "core_wdm_channels": self.core_wdm_channels,
+            "agg_wdm_channels": self.agg_wdm_channels,
+            "channel_bandwidth_gbps": self.channel_bandwidth_gbps,
+            "core_insertion_loss_db": self.core_insertion_loss_db,
+            "agg_insertion_loss_db": self.agg_insertion_loss_db,
+            "gpu_bandwidth_gbps": self.gpu_bandwidth_gbps,
+        }
 
     # ------------------------------------------------------------------ #
     # Construction helpers
@@ -121,31 +298,31 @@ class FatTreeTopology:
                 core_offset = agg_idx * (self.k // 2)
                 for c in range(self.k // 2):
                     core_node = core_nodes[core_offset + c]
-                    # Long-reach optical fiber: 16 wavelengths x 50 Gbps = 800 Gbps
+                    # Long-reach optical fiber (default: 16 wavelengths x 50 Gbps = 800 Gbps)
                     self._add_link(
                         agg_node,
                         core_node,
-                        bandwidth_gbps=800.0,
+                        bandwidth_gbps=self.core_wdm_channels * self.channel_bandwidth_gbps,
                         base_latency_ns=50.0,
                         media_type="optical",
-                        insertion_loss_db=0.8,
-                        total_wdm_channels=16,
-                        channel_bandwidth_gbps=50.0,
+                        insertion_loss_db=self.core_insertion_loss_db,
+                        total_wdm_channels=self.core_wdm_channels,
+                        channel_bandwidth_gbps=self.channel_bandwidth_gbps,
                     )
 
             # Link Edge tier to Aggregation tier within the same Pod
             for agg_node in agg_nodes:
                 for edge_node in edge_nodes:
-                    # Short-reach optical: 8 wavelengths x 50 Gbps = 400 Gbps
+                    # Short-reach optical (default: 8 wavelengths x 50 Gbps = 400 Gbps)
                     self._add_link(
                         edge_node,
                         agg_node,
-                        bandwidth_gbps=400.0,
+                        bandwidth_gbps=self.agg_wdm_channels * self.channel_bandwidth_gbps,
                         base_latency_ns=100.0,
                         media_type="optical",
-                        insertion_loss_db=0.5,
-                        total_wdm_channels=8,
-                        channel_bandwidth_gbps=50.0,
+                        insertion_loss_db=self.agg_insertion_loss_db,
+                        total_wdm_channels=self.agg_wdm_channels,
+                        channel_bandwidth_gbps=self.channel_bandwidth_gbps,
                     )
 
             # 3. Create and Link GPUs to Edge Switches
@@ -153,16 +330,16 @@ class FatTreeTopology:
                 for g in range(self.gpus_per_edge_switch):
                     gpu_id = f"pod_{pod}_gpu_{edge_idx * self.gpus_per_edge_switch + g}"
                     self.graph.add_node(gpu_id, type="gpu")
-                    # Electrical NVLink/PCIe trace: single 400 Gbps lane, no WDM
+                    # Electrical NVLink/PCIe trace: single lane, no WDM (default 400 Gbps)
                     self._add_link(
                         gpu_id,
                         edge_node,
-                        bandwidth_gbps=400.0,
+                        bandwidth_gbps=self.gpu_bandwidth_gbps,
                         base_latency_ns=20.0,
                         media_type="copper",
                         insertion_loss_db=0.0,
                         total_wdm_channels=1,
-                        channel_bandwidth_gbps=400.0,
+                        channel_bandwidth_gbps=self.gpu_bandwidth_gbps,
                     )
 
         print(f"Successfully constructed a Fat-Tree cluster fabric with {len(self.graph.nodes)} interconnected nodes.")
@@ -205,3 +382,19 @@ if __name__ == "__main__":
     print(f"\nAfter booking channels {{0, 3, 7}} on {u} -> {v}:")
     print(f"  forward free: {topo.get_available_wavelengths(u, v)}")
     print(f"  reverse free: {topo.get_available_wavelengths(v, u)}  (independent)")
+
+    # Custom hardware profile: 32 wavelengths per core link, 800 Gbps GPU links
+    custom = FatTreeTopology.from_config_dict(
+        {"name": "demo", "k": 6, "core_wdm_channels": 32, "gpu_bandwidth_gbps": 800}
+    )
+    core_link = custom.graph.edges["pod_0_agg_0", "core_0"]
+    gpu_link = custom.graph.edges["pod_0_gpu_0", "pod_0_edge_0"]
+    print(f"\nCustom profile {custom.profile_name!r}: {custom.hardware_profile}")
+    print(f"  agg->core: {core_link['total_wdm_channels']} ch x {core_link['channel_bandwidth_gbps']} Gbps "
+          f"= {core_link['bandwidth_gbps']} Gbps; GPU link {gpu_link['bandwidth_gbps']} Gbps")
+
+    for bad in ({"k": 5}, {"core_wdm_channels": 0}, {"gpu_bandwidth_gbps": "fast"}, {"bogus": 1}):
+        try:
+            FatTreeTopology.from_config_dict(bad)
+        except ValueError as exc:
+            print(f"  rejected {bad}: {exc}")
