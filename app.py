@@ -66,7 +66,8 @@ def _load_benchmark() -> Any:
 
     required = (
         "ECMPRouter", "PhysicsModel", "WORKLOADS", "THROTTLE_TEMP_C", "evaluate",
-        "link_latency_ns", "mean_metrics", "run_engine", "exceeds_gpu_port",
+        "link_latency_ns", "mean_metrics", "run_engine", "min_unavoidable_failures",
+        "build_moe_all_to_all", "MOE_TOP_K", "MOE_SEED",
     )  # fmt: skip
     missing = [attr for attr in required if not hasattr(module, attr)]
     if missing:
@@ -85,7 +86,11 @@ ECMP_NAME = "Blind ECMP"
 ENGINE_NAME = "OpticRoute Engine"
 
 CLUSTER_SCALES: tuple[int, ...] = (4, 6, 8)
-WORKLOAD_ORDER: tuple[str, ...] = ("Cross-Pod Shift", "Ring All-Reduce")
+MOE_WORKLOAD = "MoE All-to-All"
+WORKLOAD_ORDER: tuple[str, ...] = ("Cross-Pod Shift", "Ring All-Reduce", MOE_WORKLOAD)
+TOP_K_RANGE: tuple[int, int] = (1, 4)
+DEFAULT_TOP_K: int = min(max(int(bench.MOE_TOP_K), TOP_K_RANGE[0]), TOP_K_RANGE[1])
+DEFAULT_MOE_SEED: int = int(bench.MOE_SEED)
 WORKLOADS = {spec.name: spec for spec in bench.WORKLOADS}
 _missing_workloads = [name for name in WORKLOAD_ORDER if name not in WORKLOADS]
 if _missing_workloads:
@@ -156,6 +161,8 @@ class SimParams:
     heating_c_per_gbps: float
     ecmp_trials: int
     seed: int
+    top_k_experts: int = DEFAULT_TOP_K  # used by MoE All-to-All only
+    moe_seed: int = DEFAULT_MOE_SEED  # used by MoE All-to-All only
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +194,7 @@ class CoSimResult:
     ecmp_latency: LatencyParts
     engine_latency: LatencyParts
     ecmp_over_budget_flows: float  # mean flows per trial that ECMP sends over a path above budget
-    port_limited: bool  # a single flow exceeds its GPU's access link
+    unavoidable_failed_flows: int  # lower bound on failures from GPU access-link limits, any router
     ecmp_tiers: dict[str, TierTemps]
     engine_tiers: dict[str, TierTemps]
     switch_temps: pd.DataFrame
@@ -310,7 +317,15 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
     )
     physics = bench.PhysicsModel.from_engine(engine)
     generator = AIWorkloadGenerator(topology)
-    flows = spec.builder(generator, float(params.tensor_gb))
+    if params.workload == MOE_WORKLOAD:
+        flows = bench.build_moe_all_to_all(
+            generator,
+            float(params.tensor_gb),
+            top_k_experts=params.top_k_experts,
+            seed=params.moe_seed,
+        )
+    else:
+        flows = spec.builder(generator, float(params.tensor_gb))
     total_flows = len(flows)
     tier_of = {node: attrs["type"] for node, attrs in graph.nodes(data=True) if attrs["type"] in TIERS}
 
@@ -434,7 +449,7 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
         ecmp_latency=ecmp_latency,
         engine_latency=engine_latency,
         ecmp_over_budget_flows=over_budget,
-        port_limited=bench.exceeds_gpu_port(graph, flows, physics.sync_window_s),
+        unavoidable_failed_flows=bench.min_unavoidable_failures(graph, flows, physics.sync_window_s),
         ecmp_tiers=ecmp_tiers,
         engine_tiers=engine_tiers,
         switch_temps=pd.DataFrame(switch_rows, columns=["Switch", "Tier", "ECMP", "Engine"]),
@@ -611,6 +626,17 @@ def render_sidebar() -> tuple[SimParams, bool]:
             format_func=lambda value: f"k = {value}  ({value**3 // 4} GPUs)",
         )
         workload = st.selectbox("Workload pattern", WORKLOAD_ORDER)
+        top_k = DEFAULT_TOP_K
+        if workload == MOE_WORKLOAD:
+            top_k = st.slider(
+                "Top-K experts",
+                min_value=TOP_K_RANGE[0],
+                max_value=TOP_K_RANGE[1],
+                value=DEFAULT_TOP_K,
+                step=1,
+                help="Experts each GPU dispatches its tokens to. Destinations are skewed toward "
+                "a few popular experts, which creates hot spots.",
+            )
         tensor_gb = st.slider("Tensor size", min_value=10, max_value=50, value=50, step=5, format="%d GB")
         power_budget_db = st.slider(
             "Optical power budget",
@@ -635,6 +661,17 @@ def render_sidebar() -> tuple[SimParams, bool]:
             )
             trials = st.slider("ECMP random trials", min_value=5, max_value=100, value=50, step=5)
             seed = st.number_input("ECMP random seed", min_value=0, value=2026, step=1)
+            if workload == MOE_WORKLOAD:
+                moe_seed = st.number_input(
+                    "MoE dispatch seed",
+                    min_value=0,
+                    value=DEFAULT_MOE_SEED,
+                    step=1,
+                    help="Seeds which experts are popular and which GPUs get picked. "
+                    "The same seed always gives the same traffic.",
+                )
+            else:
+                moe_seed = DEFAULT_MOE_SEED
         run_clicked = st.button("Run Co-Simulation", type="primary", **_stretch(st.button))
         st.caption("Both routers receive identical flows in identical order.")
 
@@ -646,6 +683,8 @@ def render_sidebar() -> tuple[SimParams, bool]:
         heating_c_per_gbps=float(heating),
         ecmp_trials=int(trials),
         seed=int(seed),
+        top_k_experts=int(top_k),
+        moe_seed=int(moe_seed),
     )
     return params, bool(run_clicked)
 
@@ -719,6 +758,39 @@ def render_kpis(result: CoSimResult) -> None:
     )
 
 
+def render_floor(result: CoSimResult) -> None:
+    """Show the unavoidable GPU port-limit failures and how far each router sits above it."""
+    floor = result.unavoidable_failed_flows
+    engine_extra = result.engine.failed_flows - floor
+    ecmp_extra = result.ecmp.failed_flows - floor
+    trials = result.params.ecmp_trials
+    st.markdown(
+        f"**Unavoidable GPU port-limit failures: {_fmt_num(floor)}** of {result.total_flows} flows "
+        "(lower bound for any router)"
+    )
+    st.caption(
+        "Each GPU has one 400 Gbps access link, so flows beyond what a source or destination GPU "
+        "can send or receive in the sync window fail no matter how they are routed. "
+        f"Avoidable fabric failures above this floor: {ENGINE_NAME} {_fmt_num(max(engine_extra, 0.0))}, "
+        f"{ECMP_NAME} {_fmt_num(max(ecmp_extra, 0.0))} (mean of {trials} trials)."
+    )
+    if abs(engine_extra) <= _EPSILON:
+        if floor == 0:
+            st.success(f"{ENGINE_NAME} blocked no flows: zero avoidable fabric failures.")
+        else:
+            st.success(
+                f"{ENGINE_NAME} sits exactly on the floor: every flow it blocked was unavoidable, "
+                "so it caused zero avoidable fabric failures."
+            )
+    elif engine_extra > 0:
+        st.warning(
+            f"{ENGINE_NAME} blocked {_fmt_num(engine_extra)} flows above the floor "
+            "(no feasible path: wavelengths, copper headroom, power budget or thermal limit)."
+        )
+    if floor > 0:
+        st.caption("With a non-zero floor, compare routers by failures above it, not by latency.")
+
+
 def render_notices(result: CoSimResult) -> None:
     engine = result.engine
     if engine.failed_flows > 0:
@@ -726,11 +798,6 @@ def render_notices(result: CoSimResult) -> None:
             f"The engine blocked {_fmt_num(engine.failed_flows)} of {result.total_flows} flows. Its "
             "latency and temperature figures cover the routed flows only, and blocked traffic "
             "generates no heat. Compare these results by failed-flow counts first."
-        )
-    if result.port_limited:
-        st.info(
-            "At this tensor size a single flow exceeds its GPU's access link, so no router can "
-            "carry it cleanly. Compare by failed flows, not latency."
         )
     if result.ecmp_over_budget_flows > 0:
         st.warning(
@@ -803,13 +870,19 @@ def render_results(result: CoSimResult) -> None:
         if result.wdm_channels_total
         else 0.0
     )
+    workload_text = (
+        f"{params.workload} (top-{params.top_k_experts} experts)"
+        if params.workload == MOE_WORKLOAD
+        else params.workload
+    )
     st.caption(
-        f"k = {params.k} ({result.gpu_count} GPUs) · {params.workload} · {params.tensor_gb} GB "
+        f"k = {params.k} ({result.gpu_count} GPUs) · {workload_text} · {params.tensor_gb} GB "
         f"· {result.total_flows} flows · power budget {params.power_budget_db:.1f} dB "
         f"· ran in {result.elapsed_s:.1f} s"
     )
 
     render_kpis(result)
+    render_floor(result)
     render_notices(result)
     st.caption(
         f"{ENGINE_NAME}: longest routed path {loss_text} of the {params.power_budget_db:.1f} dB budget "
@@ -828,6 +901,9 @@ def render_results(result: CoSimResult) -> None:
             "power budget, and steers around hot switches.\n"
             "- Both use the same heating model and the same latency scoring, evaluated after all "
             "flows are placed. Collisions are counted when a flow is booked.\n"
+            "- **MoE All-to-All** sends each GPU's tokens to its top-K experts in other pods, "
+            "skewed toward popular experts. Hot experts receive far more than their access link "
+            "can take, so some failures are unavoidable for any router.\n"
             "- Thermal and latency constants are model parameters, not measured hardware values."
         )
 
