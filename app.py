@@ -181,32 +181,185 @@ FLOW_COLUMNS = [
 ]  # fmt: skip
 BLOCKED_COLUMNS = ["Flow", "Source", "Destination", "Reason"]
 
-_HEADER_CSS = """
+_THEME_CSS = """
 <style>
-.or-header {
-    background: linear-gradient(90deg, #0B1F3A 0%, #0A4C7A 60%, #0072B2 100%);
-    border-radius: 10px;
-    padding: 1.1rem 1.5rem;
-    margin-bottom: 1rem;
+:root {
+    --or-cyan: #00E5FF;
+    --or-slate: #1E293B;
+    --or-ink: #0B1220;
+    --or-muted: #94A3B8;
+    --or-text: #F1F5F9;
 }
+[data-testid="stMainBlockContainer"], .block-container { padding-top: 2rem; }
+section[data-testid="stSidebar"] { border-right: 1px solid rgba(0, 229, 255, 0.18); }
+
+/* ---- Hero banner ---------------------------------------------------- */
+.or-hero {
+    background:
+        radial-gradient(circle at 88% 0%, rgba(0, 229, 255, 0.20) 0%, rgba(0, 229, 255, 0) 45%),
+        linear-gradient(135deg, #0B1220 0%, #0F2742 55%, #0A4C7A 100%);
+    border: 1px solid rgba(0, 229, 255, 0.28);
+    border-radius: 16px;
+    box-shadow: 0 0 28px rgba(0, 229, 255, 0.10);
+    padding: 1.5rem 1.75rem 1.4rem;
+    margin-bottom: 1.4rem;
+}
+.or-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    max-width: 100%;
+    border: 1px solid rgba(0, 229, 255, 0.60);
+    background: rgba(0, 229, 255, 0.08);
+    color: var(--or-cyan);
+    border-radius: 999px;
+    padding: 0.32rem 0.9rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    line-height: 1.3;
+}
+.or-dot {
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--or-cyan);
+    box-shadow: 0 0 8px var(--or-cyan);
+    animation: or-pulse 2.4s ease-in-out infinite;
+}
+@keyframes or-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .or-dot { animation: none; } }
 .or-title {
     color: #FFFFFF;
-    font-size: 1.9rem;
+    font-size: 2.15rem;
     font-weight: 700;
-    letter-spacing: 0.02em;
+    letter-spacing: -0.01em;
     line-height: 1.2;
+    margin-top: 0.9rem;
 }
 .or-subtitle {
-    color: #CFE3F3;
-    font-size: 1rem;
-    margin-top: 0.2rem;
+    color: #BFD3E6;
+    font-size: 1.02rem;
+    line-height: 1.55;
+    max-width: 58rem;
+    margin-top: 0.55rem;
 }
+.or-steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1.25rem;
+    margin-top: 1.3rem;
+}
+.or-step {
+    position: relative;
+    background: rgba(15, 23, 42, 0.70);
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    border-radius: 12px;
+    padding: 0.8rem 1rem 0.85rem;
+}
+.or-step:not(:last-child)::after {
+    content: "→";
+    position: absolute;
+    top: 50%;
+    right: -1.25rem;
+    width: 1.25rem;
+    transform: translateY(-50%);
+    text-align: center;
+    color: var(--or-cyan);
+    font-size: 1.05rem;
+}
+.or-step-title { color: #F8FAFC; font-size: 0.95rem; font-weight: 600; line-height: 1.35; }
+.or-step-n { color: var(--or-cyan); font-weight: 700; }
+.or-step-text { color: var(--or-muted); font-size: 0.82rem; line-height: 1.45; margin-top: 0.3rem; }
+@media (max-width: 760px) {
+    .or-hero { padding: 1.2rem 1.1rem; }
+    .or-title { font-size: 1.6rem; }
+    .or-steps { grid-template-columns: minmax(0, 1fr); gap: 1.4rem; }
+    .or-step:not(:last-child)::after {
+        content: "↓";
+        top: auto;
+        right: auto;
+        bottom: -1.4rem;
+        left: 50%;
+        width: auto;
+        height: 1.4rem;
+        line-height: 1.4rem;
+        transform: translateX(-50%);
+    }
+}
+
+/* ---- KPI cards (the bordered container that holds each st.metric) ---- */
+[data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):not(:has([data-testid="stVerticalBlockBorderWrapper"])) {
+    background: linear-gradient(145deg, #0F172A 0%, var(--or-slate) 100%);
+    border: 1px solid rgba(0, 229, 255, 0.55);
+    border-radius: 14px;
+    box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.10), 0 0 18px rgba(0, 229, 255, 0.22),
+        inset 0 0 24px rgba(0, 229, 255, 0.05);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):not(:has([data-testid="stVerticalBlockBorderWrapper"])):hover {
+    border-color: var(--or-cyan);
+    box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.25), 0 0 26px rgba(0, 229, 255, 0.38),
+        inset 0 0 24px rgba(0, 229, 255, 0.07);
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):not(:has([data-testid="stVerticalBlockBorderWrapper"])) [data-testid="stCaptionContainer"],
+[data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):not(:has([data-testid="stVerticalBlockBorderWrapper"])) [data-testid="stCaptionContainer"] * {
+    color: var(--or-muted) !important;
+}
+[data-testid="stMetric"] { border-left: 3px solid var(--or-cyan); padding-left: 0.75rem; }
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {
+    color: var(--or-muted) !important;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * {
+    color: #F8FAFC !important;
+    font-size: 1.85rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+}
+[data-testid="stMetricDelta"], [data-testid="stMetricDelta"] * { font-weight: 600; }
+
+/* ---- Controls ------------------------------------------------------- */
+section[data-testid="stSidebar"] button[kind="primary"],
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
+    background: linear-gradient(90deg, #00B8D4 0%, var(--or-cyan) 100%);
+    border: none;
+    box-shadow: 0 0 14px rgba(0, 229, 255, 0.35);
+}
+section[data-testid="stSidebar"] button[kind="primary"] *,
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] * {
+    color: #06121F !important;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+section[data-testid="stSidebar"] button[kind="primary"]:hover,
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover { filter: brightness(1.08); }
+section[data-testid="stSidebar"] button[kind="primary"]:disabled,
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:disabled {
+    opacity: 0.45;
+    box-shadow: none;
+}
+[data-testid="stExpander"] { border-radius: 12px; }
 </style>
-<div class="or-header">
-    <div class="or-title">OpticRoute Fabric</div>
-    <div class="or-subtitle">Silicon Photonics Digital Twin &middot; Co-Simulation Dashboard</div>
-</div>
 """
+
+_HERO_HTML = """<div class="or-hero">
+<span class="or-pill"><span class="or-dot"></span>OPTICROUTE FABRIC &bull; SILICON PHOTONICS DIGITAL TWIN</span>
+<div class="or-title">Stress-test your optical fabric before you build it</div>
+<div class="or-subtitle">A physics-aware digital twin for AI optical fabrics: route collective traffic across WDM wavelengths, insertion-loss budgets and switch thermals, and benchmark it against blind ECMP on your own hardware spec.</div>
+<div class="or-steps">
+<div class="or-step"><div class="or-step-title"><span class="or-step-n">1.</span> Configure or Upload Optical Spec</div><div class="or-step-text">Download the sample YAML, edit it, or upload your own WDM, insertion-loss and GPU-link specs.</div></div>
+<div class="or-step"><div class="or-step-title"><span class="or-step-n">2.</span> Stress-Test AI Collective Bursts</div><div class="or-step-text">Run Cross-Pod Shift, Ring All-Reduce or MoE All-to-All side by side against blind ECMP.</div></div>
+<div class="or-step"><div class="or-step-title"><span class="or-step-n">3.</span> Export Thermal &amp; WDM Diagnostics</div><div class="or-step-text">Download a per-flow CSV with paths, insertion loss, peak switch temperature and wavelengths.</div></div>
+</div>
+</div>"""
+
+_HEADER_HTML = _THEME_CSS + _HERO_HTML
 
 
 # --------------------------------------------------------------------------- #
@@ -802,6 +955,8 @@ def build_tier_chart(result: CoSimResult, statistic: str) -> go.Figure:
         yaxis_range=[AMBIENT_TEMP_C - 5.0, MAX_TEMP_C + 10.0],
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         height=420,
     )
     return fig
@@ -831,6 +986,8 @@ def build_latency_chart(result: CoSimResult) -> go.Figure:
         yaxis_title="Average latency per flow (ns)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         height=420,
     )
     return fig
@@ -863,6 +1020,8 @@ def build_switch_chart(switch_temps: pd.DataFrame) -> go.Figure:
         yaxis_range=[AMBIENT_TEMP_C - 5.0, MAX_TEMP_C + 10.0],
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         height=460,
     )
     return fig
@@ -872,7 +1031,7 @@ def build_switch_chart(switch_temps: pd.DataFrame) -> go.Figure:
 # UI
 # --------------------------------------------------------------------------- #
 def render_header() -> None:
-    st.markdown(_HEADER_CSS, unsafe_allow_html=True)
+    st.markdown(_HEADER_HTML, unsafe_allow_html=True)
 
 
 def render_hardware_section() -> tuple[HardwareProfile, bool]:
