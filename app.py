@@ -30,6 +30,7 @@ import statistics
 import sys
 import re
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -193,14 +194,40 @@ _THEME_CSS = """
 [data-testid="stMainBlockContainer"], .block-container { padding-top: 2rem; }
 section[data-testid="stSidebar"] { border-right: 1px solid rgba(0, 229, 255, 0.18); }
 
+/* ---- SaaS chrome: hide the hamburger menu, deploy button and footer --- */
+#MainMenu, footer, [data-testid="stDeployButton"], .stDeployButton, [data-testid="stFooter"],
+[data-testid="stDecoration"] { visibility: hidden; display: none; }
+header[data-testid="stHeader"] { background: transparent; }
+
+/* ---- Ambient glow behind the glass panels (adds to the theme background) */
+[data-testid="stApp"] {
+    background-image:
+        radial-gradient(circle at 8% 0%, rgba(0, 229, 255, 0.10) 0%, rgba(0, 229, 255, 0) 38%),
+        radial-gradient(circle at 92% 18%, rgba(99, 102, 241, 0.10) 0%, rgba(99, 102, 241, 0) 42%);
+    background-attachment: fixed;
+}
+
+/* ---- Gradient section headers ----------------------------------------- */
+[data-testid="stMainBlockContainer"] h3, .block-container h3 {
+    background: linear-gradient(90deg, #00B8D4 0%, #38BDF8 55%, #818CF8 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent !important;
+    -webkit-text-fill-color: transparent !important;
+    font-weight: 700;
+    letter-spacing: -0.005em;
+}
+
 /* ---- Hero banner ---------------------------------------------------- */
 .or-hero {
     background:
         radial-gradient(circle at 88% 0%, rgba(0, 229, 255, 0.20) 0%, rgba(0, 229, 255, 0) 45%),
-        linear-gradient(135deg, #0B1220 0%, #0F2742 55%, #0A4C7A 100%);
-    border: 1px solid rgba(0, 229, 255, 0.28);
+        linear-gradient(135deg, rgba(11, 18, 32, 0.86) 0%, rgba(15, 39, 66, 0.82) 55%, rgba(10, 76, 122, 0.80) 100%);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 229, 255, 0.30);
     border-radius: 16px;
-    box-shadow: 0 0 28px rgba(0, 229, 255, 0.10);
+    box-shadow: 0 0 28px rgba(0, 229, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.06);
     padding: 1.5rem 1.75rem 1.4rem;
     margin-bottom: 1.4rem;
 }
@@ -253,8 +280,10 @@ section[data-testid="stSidebar"] { border-right: 1px solid rgba(0, 229, 255, 0.1
 }
 .or-step {
     position: relative;
-    background: rgba(15, 23, 42, 0.70);
-    border: 1px solid rgba(148, 163, 184, 0.25);
+    background: rgba(15, 23, 42, 0.55);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 229, 255, 0.22);
     border-radius: 12px;
     padding: 0.8rem 1rem 0.85rem;
 }
@@ -291,7 +320,9 @@ section[data-testid="stSidebar"] { border-right: 1px solid rgba(0, 229, 255, 0.1
 
 /* ---- KPI cards (the bordered container that holds each st.metric) ---- */
 [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):not(:has([data-testid="stVerticalBlockBorderWrapper"])) {
-    background: linear-gradient(145deg, #0F172A 0%, var(--or-slate) 100%);
+    background: linear-gradient(145deg, rgba(15, 23, 42, 0.78) 0%, rgba(30, 41, 59, 0.62) 100%);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
     border: 1px solid rgba(0, 229, 255, 0.55);
     border-radius: 14px;
     box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.10), 0 0 18px rgba(0, 229, 255, 0.22),
@@ -344,7 +375,34 @@ section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:disabled {
     opacity: 0.45;
     box-shadow: none;
 }
-[data-testid="stExpander"] { border-radius: 12px; }
+
+/* ---- Glass panels: charts, expanders, alerts ---------------------------- */
+[data-testid="stPlotlyChart"] {
+    background: rgba(148, 163, 184, 0.06);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 229, 255, 0.22);
+    border-radius: 14px;
+    box-shadow: 0 0 16px rgba(0, 229, 255, 0.07), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    padding: 0.5rem 0.5rem 0.25rem;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+[data-testid="stPlotlyChart"]:hover {
+    border-color: rgba(0, 229, 255, 0.45);
+    box-shadow: 0 0 22px rgba(0, 229, 255, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+[data-testid="stExpander"] {
+    background: rgba(148, 163, 184, 0.06);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 229, 255, 0.20);
+    border-radius: 12px;
+}
+[data-testid="stAlert"] {
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border-radius: 12px;
+}
 </style>
 """
 
@@ -398,6 +456,48 @@ class LatencyParts:
         return self.base + self.congestion + self.thermal
 
 
+Edge = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class FabricLink:
+    """One physical link (two opposing directed edges) of the fabric."""
+
+    a: str
+    b: str
+    media: str  # "optical" or "copper"
+    total_channels: int
+    capacity_gbps: float
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FabricState:
+    """What one router left on the fabric. Link values are aligned with FabricSnapshot.links."""
+
+    temps: dict[str, float]  # final temperature per switch
+    booked_channels: tuple[float, ...]  # wavelengths booked on the link's busier direction
+    load_gbps: tuple[float, ...]  # booked Gbps on the link's busier direction
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FabricSnapshot:
+    """Everything the topology visualizer needs, for both routers."""
+
+    k: int
+    node_tier: dict[str, str]  # every node: core, aggregation, edge or gpu
+    links: tuple[FabricLink, ...]
+    engine: FabricState
+    ecmp: FabricState  # mean across the ECMP trials
+    ecmp_trials: int
+
+
+def link_load_fraction(link: FabricLink, booked_channels: float, load_gbps: float) -> float:
+    """Optical links: booked wavelengths / wavelengths. Copper links: booked Gbps / capacity."""
+    if link.media == "optical":
+        return booked_channels / link.total_channels
+    return load_gbps / link.capacity_gbps
+
+
 @dataclass(slots=True, eq=False)
 class CoSimResult:
     params: SimParams
@@ -419,6 +519,7 @@ class CoSimResult:
     wdm_channels_booked: int
     wdm_channels_total: int
     elapsed_s: float
+    fabric: FabricSnapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -711,6 +812,69 @@ def _average_tier_stats(runs: Sequence[dict[str, TierTemps]]) -> dict[str, TierT
     }
 
 
+def _ecmp_wavelengths_booked(graph: Any, run: Any) -> dict[Edge, int]:
+    """
+    Wavelengths blind ECMP booked on each optical edge in one trial. It books the lowest free
+    wavelengths and overlaps on ones already in use once the link is full, so the count is the
+    wavelengths all its flows asked for, capped at the link's total.
+    """
+    asked: dict[Edge, int] = defaultdict(int)
+    for flow in run.placed:
+        for edge in zip(flow.path, flow.path[1:]):
+            attrs = graph.edges[edge]
+            if attrs["media_type"] == "optical":
+                asked[edge] += OpticalRoutingEngine._channels_needed(attrs, flow.demand_gbps)
+    return {edge: min(count, graph.edges[edge]["total_wdm_channels"]) for edge, count in asked.items()}
+
+
+def _build_fabric_snapshot(
+    graph: Any,
+    k: int,
+    *,
+    engine_temps: Mapping[str, float],
+    engine_booked: Mapping[Edge, float],
+    engine_load: Mapping[Edge, float],
+    ecmp_runs: Sequence[Any],
+    ecmp_temps: Mapping[str, float],
+) -> FabricSnapshot:
+    """Collect per-link load and per-switch temperature for both routers (read-only)."""
+    links = tuple(
+        FabricLink(
+            a=a,
+            b=b,
+            media=graph.edges[a, b]["media_type"],
+            total_channels=graph.edges[a, b]["total_wdm_channels"],
+            capacity_gbps=graph.edges[a, b]["bandwidth_gbps"],
+        )
+        for a, b in sorted({tuple(sorted(edge)) for edge in graph.edges})
+    )
+
+    trials = len(ecmp_runs)
+    ecmp_booked: dict[Edge, float] = defaultdict(float)
+    ecmp_load: dict[Edge, float] = defaultdict(float)
+    for run in ecmp_runs:
+        for edge, count in _ecmp_wavelengths_booked(graph, run).items():
+            ecmp_booked[edge] += count / trials
+        for edge, gbps in run.load.items():
+            ecmp_load[edge] += gbps / trials
+
+    def state(temps: Mapping[str, float], booked: Mapping[Edge, float], load: Mapping[Edge, float]) -> FabricState:
+        return FabricState(
+            temps=dict(temps),
+            booked_channels=tuple(max(booked.get((l.a, l.b), 0.0), booked.get((l.b, l.a), 0.0)) for l in links),
+            load_gbps=tuple(max(load.get((l.a, l.b), 0.0), load.get((l.b, l.a), 0.0)) for l in links),
+        )
+
+    return FabricSnapshot(
+        k=k,
+        node_tier={node: attrs["type"] for node, attrs in graph.nodes(data=True)},
+        links=links,
+        engine=state(engine_temps, engine_booked, engine_load),
+        ecmp=state(ecmp_temps, ecmp_booked, ecmp_load),
+        ecmp_trials=trials,
+    )
+
+
 def run_cosimulation(params: SimParams) -> CoSimResult:
     """Run blind ECMP and the OpticalRoutingEngine on identical flows and score both."""
     started = time.perf_counter()
@@ -785,6 +949,11 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
     if len(blocked) != engine_run.failed_flows:
         raise AssertionError("Engine runs disagree on how many flows were blocked")
     summary = engine.fabric_utilization_summary()
+    engine_booked = {
+        (u, v): len(attrs["booked_channels"])
+        for u, v, attrs in graph.edges(data=True)
+        if attrs["media_type"] == "optical"
+    }
 
     flow_rows: list[dict[str, Any]] = []
     hop_rows: list[dict[str, Any]] = []
@@ -851,6 +1020,16 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
     routed_losses = [route.total_insertion_loss_db for route in routes.values() if route.routed]
     engine.reset_fabric_load()
 
+    fabric = _build_fabric_snapshot(
+        graph,
+        params.k,
+        engine_temps=engine_run.temps,
+        engine_booked=engine_booked,
+        engine_load=engine_run.load,
+        ecmp_runs=ecmp_runs,
+        ecmp_temps=ecmp_switch_temps,
+    )
+
     return CoSimResult(
         params=params,
         total_flows=total_flows,
@@ -871,6 +1050,7 @@ def run_cosimulation(params: SimParams) -> CoSimResult:
         wdm_channels_booked=int(summary["optical_channels_booked"]),
         wdm_channels_total=int(summary["optical_channels_total"]),
         elapsed_s=time.perf_counter() - started,
+        fabric=fabric,
     )
 
 
@@ -1024,6 +1204,325 @@ def build_switch_chart(switch_temps: pd.DataFrame) -> go.Figure:
         plot_bgcolor="rgba(0,0,0,0)",
         height=460,
     )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Interactive fabric topology (3D / 2D)
+# --------------------------------------------------------------------------- #
+ENGINE_FABRIC_LABEL = "OpticRoute Engine Fabric"
+ECMP_FABRIC_LABEL = "Blind ECMP Fabric"
+VIEW_3D_LABEL = "3D View"
+VIEW_2D_LABEL = "2D View"
+
+# Cool cyan from ambient (35 °C) through the normal operating range, amber as a switch warms
+# toward the limit (about 64 °C), crimson at the 80 °C throttle threshold and above.
+FABRIC_COLORSCALE = [[0.0, "#00E5FF"], [0.3, "#00E5FF"], [0.65, "#F59E0B"], [1.0, "#EF4444"]]
+FABRIC_COLORBAR_TICKS: tuple[float, ...] = (35.0, 50.0, 65.0, 80.0)
+
+# (legend name, upper bound of booked-load fraction, colour, width in 3D, width in 2D)
+LINK_BUCKETS: tuple[tuple[str, float, str, float, float], ...] = (
+    ("Idle links", 0.0, "rgba(148,163,184,0.22)", 1.0, 1.0),
+    ("Light load (under 34%)", 0.34, "rgba(0,229,255,0.65)", 3.0, 2.5),
+    ("Moderate load (34-66%)", 0.67, "rgba(245,158,11,0.80)", 5.0, 4.0),
+    ("Heavy load (67% and up)", math.inf, "rgba(239,68,68,0.90)", 8.0, 6.0),
+)
+TIER_STYLES: tuple[tuple[str, str, str, float, float], ...] = (
+    # tier, legend name, symbol, 3D size, 2D size
+    ("core", "Core switches (top tier)", "diamond", 11.0, 17.0),
+    ("aggregation", "Aggregation switches (middle tier)", "square", 8.0, 13.0),
+    ("edge", "Edge switches (lower tier)", "circle", 6.5, 11.0),
+)
+_POD_NODE = re.compile(r"^pod_(\d+)_(agg|edge|gpu)_(\d+)$")
+
+
+def _bucket_index(fraction: float) -> int:
+    if fraction <= _EPSILON:
+        return 0
+    for index, (_, upper, *_rest) in enumerate(LINK_BUCKETS):
+        if index and fraction < upper:
+            return index
+    return len(LINK_BUCKETS) - 1
+
+
+def fabric_positions(k: int, three_d: bool) -> dict[str, tuple[float, ...]]:
+    """
+    Coordinates for every node. Tiers stack bottom to top: GPUs, edge, aggregation, core.
+    3D puts the pods on a ring around the core grid; 2D lines the pods up side by side.
+    """
+    half = k // 2
+    gpu_pitch = 0.34
+    edge_pitch = max(1.1, half * gpu_pitch + 0.35)
+    pod_span = (half - 1) * edge_pitch
+    gpu_reach = (half - 1) * gpu_pitch
+    centre = (half - 1) / 2
+
+    def pod_offset(index: int) -> float:
+        return (index - centre) * edge_pitch
+
+    positions: dict[str, tuple[float, ...]] = {}
+    if three_d:
+        radius = max(2.2, k * (pod_span + gpu_reach + 2.4) / (2 * math.pi))
+        spacing = min(2.4, 1.6 * radius / half)
+        for core in range(half * half):
+            positions[f"core_{core}"] = (
+                (core % half - centre) * spacing,
+                (core // half - centre) * spacing,
+                3.0,
+            )
+        for pod in range(k):
+            angle = 2 * math.pi * pod / k
+            cx, cy = radius * math.cos(angle), radius * math.sin(angle)
+            tx, ty = -math.sin(angle), math.cos(angle)  # along the pod
+            rx, ry = math.cos(angle), math.sin(angle)  # away from the centre
+            for index in range(half):
+                u = pod_offset(index)
+                positions[f"pod_{pod}_agg_{index}"] = (cx + u * tx + 0.45 * rx, cy + u * ty + 0.45 * ry, 2.0)
+                positions[f"pod_{pod}_edge_{index}"] = (cx + u * tx, cy + u * ty, 1.0)
+                for g in range(half):
+                    ug = u + (g - centre) * gpu_pitch
+                    positions[f"pod_{pod}_gpu_{index * half + g}"] = (cx + ug * tx, cy + ug * ty, 0.0)
+        return positions
+
+    pod_pitch = pod_span + gpu_reach + 1.6
+    left = -(pod_span + gpu_reach) / 2
+    right = (k - 1) * pod_pitch + (pod_span + gpu_reach) / 2
+    tier_gap = max(1.0, k * pod_pitch / 6)
+    cores = half * half
+    for core in range(cores):
+        positions[f"core_{core}"] = (left + (core + 0.5) / cores * (right - left), 3 * tier_gap)
+    for pod in range(k):
+        cx = pod * pod_pitch
+        for index in range(half):
+            u = pod_offset(index)
+            positions[f"pod_{pod}_agg_{index}"] = (cx + u, 2 * tier_gap)
+            positions[f"pod_{pod}_edge_{index}"] = (cx + u, tier_gap)
+            for g in range(half):
+                positions[f"pod_{pod}_gpu_{index * half + g}"] = (cx + u + (g - centre) * gpu_pitch, 0.0)
+    return positions
+
+
+def _fmt_count(value: float) -> str:
+    return f"{value:.0f}" if abs(value - round(value)) < 0.05 else f"{value:.1f}"
+
+
+def _node_link_stats(snapshot: FabricSnapshot, state: FabricState) -> dict[str, dict[str, float]]:
+    stats: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"links": 0.0, "active": 0.0, "booked": 0.0, "channels": 0.0, "gbps": 0.0, "peak": 0.0}
+    )
+    for link, booked, gbps in zip(snapshot.links, state.booked_channels, state.load_gbps):
+        fraction = link_load_fraction(link, booked, gbps)
+        for node in (link.a, link.b):
+            entry = stats[node]
+            entry["links"] += 1
+            entry["active"] += fraction > _EPSILON
+            entry["gbps"] += gbps
+            entry["peak"] = max(entry["peak"], fraction)
+            if link.media == "optical":
+                entry["booked"] += booked
+                entry["channels"] += link.total_channels
+    return stats
+
+
+def _switch_hover(node: str, tier: str, temp: float, entry: dict[str, float], variant: str, trials: int) -> str:
+    pod = _POD_NODE.match(node)
+    where = f" · Pod {pod.group(1)}" if pod else ""
+    status = f"Throttling (at or above {THROTTLE_TEMP_C:.0f} °C)" if temp >= THROTTLE_TEMP_C else "Within limits"
+    basis = f" (mean of {trials} trials)" if variant == "ecmp" else ""
+    lines = [
+        f"<b>{node}</b>",
+        f"Tier: {NODE_LABELS[tier]} switch{where}",
+        f"Temperature: <b>{temp:.1f} °C</b>{basis}",
+        f"Status: {status}",
+        f"Active links: {_fmt_count(entry['active'])} of {_fmt_count(entry['links'])}",
+    ]
+    if entry["channels"]:
+        pct = entry["booked"] / entry["channels"] * 100.0
+        lines.append(
+            f"Booked wavelengths: {_fmt_count(entry['booked'])} of {_fmt_count(entry['channels'])} ({pct:.0f}%)"
+        )
+    lines.append(f"Busiest link: {entry['peak'] * 100:.0f}% loaded")
+    return "<br>".join(lines)
+
+
+def _gpu_hover(node: str, entry: dict[str, float], capacity_gbps: float) -> str:
+    pod = _POD_NODE.match(node)
+    where = f" · Pod {pod.group(1)}" if pod else ""
+    state_text = (
+        f"active, {entry['gbps']:,.0f} of {capacity_gbps:,.0f} Gbps ({entry['peak'] * 100:.0f}%)"
+        if entry["active"]
+        else "idle"
+    )
+    return "<br>".join(
+        [
+            f"<b>{node}</b>",
+            f"Tier: GPU{where}",
+            "Temperature: not modelled for GPUs",
+            f"Active links: {_fmt_count(entry['active'])} of {_fmt_count(entry['links'])}",
+            f"Access link: {state_text}",
+        ]
+    )
+
+
+def _link_hover(link: FabricLink, booked: float, gbps: float, fraction: float) -> str:
+    if link.media == "optical":
+        body = (
+            f"Optical link, {link.total_channels} wavelengths<br>"
+            f"Booked wavelengths: {_fmt_count(booked)} of {link.total_channels} ({fraction * 100:.0f}%)<br>"
+            f"Load: {gbps:,.0f} of {link.capacity_gbps:,.0f} Gbps"
+        )
+    else:
+        body = (
+            "Copper access link<br>"
+            f"Load: {gbps:,.0f} of {link.capacity_gbps:,.0f} Gbps ({fraction * 100:.0f}%)"
+        )
+    return f"<b>{link.a} ↔ {link.b}</b><br>{body}"
+
+
+def build_fabric_figure(snapshot: FabricSnapshot, variant: str, dimension: str) -> go.Figure:
+    """
+    The Fat-Tree as a Plotly figure. Switches are coloured by their final temperature
+    (cyan at ambient, amber, crimson at the throttle threshold). Links are drawn thicker and
+    hotter-coloured the more of their wavelengths are booked; idle links stay faint.
+    `variant` is "engine" or "ecmp" (mean of the ECMP trials); `dimension` is "3D" or "2D".
+    """
+    three_d = dimension == "3D"
+    state = snapshot.engine if variant == "engine" else snapshot.ecmp
+    positions = fabric_positions(snapshot.k, three_d)
+    trace_type = go.Scatter3d if three_d else go.Scatter
+    node_scale = 1.0 if snapshot.k <= 6 else (0.8 if snapshot.k <= 8 else 0.65)
+
+    def coords(points: Sequence[tuple[float, ...] | None]) -> dict[str, list[float | None]]:
+        axes = ("x", "y", "z") if three_d else ("x", "y")
+        return {
+            axis: [None if point is None else point[i] for point in points] for i, axis in enumerate(axes)
+        }
+
+    fig = go.Figure()
+    stats = _node_link_stats(snapshot, state)
+
+    # ---- links, one trace per load bucket so each gets its own width and colour. The copper
+    # GPU access links are drawn thin and underneath: the story is the optical fabric.
+    segments: dict[tuple[bool, int], list[tuple[float, ...] | None]] = {
+        (copper, index): [] for copper in (True, False) for index in range(len(LINK_BUCKETS))
+    }
+    midpoints: list[tuple[float, ...]] = []
+    midpoint_text: list[str] = []
+    for link, booked, gbps in zip(snapshot.links, state.booked_channels, state.load_gbps):
+        fraction = link_load_fraction(link, booked, gbps)
+        start, end = positions[link.a], positions[link.b]
+        segments[(link.media == "copper", _bucket_index(fraction))].extend([start, end, None])
+        if fraction > _EPSILON:
+            midpoints.append(tuple((a + b) / 2 for a, b in zip(start, end)))
+            midpoint_text.append(_link_hover(link, booked, gbps, fraction))
+    for copper, index in sorted(segments, key=lambda key: (not key[0], key[1])):
+        points = segments[(copper, index)]
+        if not points:
+            continue
+        name, _, color, width_3d, width_2d = LINK_BUCKETS[index]
+        width = width_3d if three_d else width_2d
+        fig.add_trace(
+            trace_type(
+                **coords(points),
+                mode="lines",
+                name=f"GPU access links: {name.lower()}" if copper else name,
+                showlegend=not copper,
+                line=dict(color=color, width=max(1.0, width * 0.35) if copper else width),
+                hoverinfo="skip",
+            )
+        )
+    if midpoints:
+        fig.add_trace(
+            trace_type(
+                **coords(midpoints),
+                mode="markers",
+                name="Active link details",
+                showlegend=False,
+                marker=dict(size=3.0 if three_d else 5.0, color="rgba(226,232,240,0.55)"),
+                hovertext=midpoint_text,
+                hoverinfo="text",
+            )
+        )
+
+    # ---- switches, coloured by temperature (one shared colour bar)
+    for index, (tier, name, symbol, size_3d, size_2d) in enumerate(TIER_STYLES):
+        nodes = sorted(node for node, kind in snapshot.node_tier.items() if kind == tier)
+        temps = [state.temps[node] for node in nodes]
+        marker = dict(
+            size=(size_3d if three_d else size_2d) * node_scale,
+            symbol=symbol,
+            color=temps,
+            colorscale=FABRIC_COLORSCALE,
+            cmin=AMBIENT_TEMP_C,
+            cmax=THROTTLE_TEMP_C,
+            showscale=index == 0,
+            line=dict(color="rgba(255,255,255,0.65)", width=1),
+        )
+        if index == 0:
+            marker["colorbar"] = dict(
+                title=dict(text="Switch temperature (°C)", side="right"),
+                thickness=12,
+                len=0.7,
+                tickvals=list(FABRIC_COLORBAR_TICKS),
+                ticktext=[f"{tick:.0f}" if tick < THROTTLE_TEMP_C else f"{tick:.0f}+" for tick in FABRIC_COLORBAR_TICKS],
+                outlinewidth=0,
+            )
+        fig.add_trace(
+            trace_type(
+                **coords([positions[node] for node in nodes]),
+                mode="markers",
+                name=name,
+                marker=marker,
+                hovertext=[
+                    _switch_hover(node, tier, temp, stats[node], variant, snapshot.ecmp_trials)
+                    for node, temp in zip(nodes, temps)
+                ],
+                hoverinfo="text",
+            )
+        )
+
+    # ---- GPUs: brighter when their access link carries traffic
+    gpus = sorted(node for node, kind in snapshot.node_tier.items() if kind == "gpu")
+    gpu_capacity = next((l.capacity_gbps for l in snapshot.links if l.media == "copper"), 0.0)
+    fig.add_trace(
+        trace_type(
+            **coords([positions[node] for node in gpus]),
+            mode="markers",
+            name="GPUs (base tier)",
+            marker=dict(
+                size=(3.5 if three_d else 6.0) * node_scale,
+                color=["#CBD5E1" if stats[node]["active"] else "#64748B" for node in gpus],
+            ),
+            hovertext=[_gpu_hover(node, stats[node], gpu_capacity) for node in gpus],
+            hoverinfo="text",
+        )
+    )
+
+    fig.update_layout(
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=660 if three_d else 560,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hoverlabel=dict(bgcolor="rgba(11,18,32,0.94)", bordercolor="#00E5FF", font=dict(color="#E2E8F0")),
+        uirevision=f"fabric-{dimension}",
+    )
+    if three_d:
+        hidden = dict(visible=False)
+        fig.update_layout(
+            scene=dict(
+                bgcolor="rgba(0,0,0,0)",
+                xaxis=hidden,
+                yaxis=hidden,
+                zaxis=hidden,
+                aspectmode="manual",
+                aspectratio=dict(x=1.0, y=1.0, z=0.55),
+                camera=dict(eye=dict(x=1.3, y=-1.55, z=0.85)),
+            )
+        )
+    else:
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
     return fig
 
 
@@ -1284,6 +1783,50 @@ def render_notices(result: CoSimResult) -> None:
         )
 
 
+def render_topology(result: CoSimResult) -> None:
+    snapshot = result.fabric
+    st.subheader("Interactive Optical Fabric Topology")
+    st.caption(
+        "The Fat-Tree after the run: core switches on top, then aggregation, edge and the GPUs at the "
+        "base. Switch colour is the final temperature; optical links get thicker and hotter as more of "
+        "their wavelengths are booked, and the copper GPU access links are drawn thin. Hover any "
+        "switch, GPU or active link for details."
+    )
+    view_col, fabric_col = st.columns([1, 2])
+    with view_col:
+        view = st.radio("Projection", [VIEW_3D_LABEL, VIEW_2D_LABEL], horizontal=True, key="fabric_projection")
+    with fabric_col:
+        fabric = st.radio(
+            "Fabric", [ENGINE_FABRIC_LABEL, ECMP_FABRIC_LABEL], horizontal=True, key="fabric_variant"
+        )
+    variant = "engine" if fabric == ENGINE_FABRIC_LABEL else "ecmp"
+    dimension = "3D" if view == VIEW_3D_LABEL else "2D"
+    st.plotly_chart(
+        build_fabric_figure(snapshot, variant, dimension), key="fabric_topology", **_stretch(st.plotly_chart)
+    )
+
+    state = snapshot.engine if variant == "engine" else snapshot.ecmp
+    hottest, hottest_temp = max(state.temps.items(), key=lambda item: (item[1], item[0]))
+    hot_count = sum(1 for temp in state.temps.values() if temp >= THROTTLE_TEMP_C - _EPSILON)
+    fractions = [
+        link_load_fraction(link, booked, gbps)
+        for link, booked, gbps in zip(snapshot.links, state.booked_channels, state.load_gbps)
+    ]
+    active = sum(1 for fraction in fractions if fraction > _EPSILON)
+    heavy = sum(1 for fraction in fractions if fraction >= LINK_BUCKETS[2][1])
+    basis = (
+        f" Shown: the mean of {snapshot.ecmp_trials} random ECMP trials, so a switch that overheats in "
+        "only some trials looks milder than it does in any single trial."
+        if variant == "ecmp"
+        else ""
+    )
+    st.caption(
+        f"{fabric}: hottest switch {hottest} at {hottest_temp:.1f} °C · {hot_count} of {len(state.temps)} "
+        f"switches at or above {THROTTLE_TEMP_C:.0f} °C · {active:,} of {len(snapshot.links):,} links "
+        f"carrying traffic, {heavy:,} heavily loaded.{basis}"
+    )
+
+
 def render_charts(result: CoSimResult) -> None:
     st.subheader("Physics diagnostics")
     left, right = st.columns(2)
@@ -1384,6 +1927,7 @@ def render_results(result: CoSimResult) -> None:
         f"· {result.wdm_channels_booked:,} of {result.wdm_channels_total:,} wavelength channels "
         f"booked ({channel_pct:.1f}%)"
     )
+    render_topology(result)
     render_charts(result)
     render_inspector(result)
 
